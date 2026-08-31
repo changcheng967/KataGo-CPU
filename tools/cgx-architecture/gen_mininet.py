@@ -9,7 +9,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 
-def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32):
+def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32, linear_attn=False):
     rng = np.random.default_rng(seed)
     inits, nodes = [], []
 
@@ -66,6 +66,29 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
             else:
                 n("Transpose", [name + t + "rs"], [name + t + "th"], perm=[0, 1, 3, 2])
                 qk.append(name + t + "th")
+        if linear_attn:
+            # phi(x) = elu(x)+1 on Q and K; y = phiQ @ (phiK @ V), heads dim hd
+            pq, pk = qk[0], qk[1]  # Q: [N,H,361,hd], K: [N,H,hd,361]
+            n("Elu", [pq], [name + "qe"]); n("Add", [name + "qe", k(name + "q1", np.array(1.0, dtype=np.float32))], [name + "pq"])
+            n("Elu", [pk], [name + "ke"]); n("Add", [name + "ke", k(name + "k1", np.array(1.0, dtype=np.float32))], [name + "pk2"])
+            v = qk[2]  # V: [N,H,361,hd]
+            if use_mask:
+                # zero off-board K columns and V rows so they contribute nothing
+                n("Reshape", [mask_in, k(name + "mr", np.array([0, 1, 361], dtype=np.int64))], [name + "mk"])
+                n("Unsqueeze", [name + "mk", k(name + "mu", np.array([2], dtype=np.int64))], [name + "mkq"])  # [N,1,1,361]
+                n("Mul", [name + "pk2", name + "mkq"], [name + "pkm"])
+                n("Unsqueeze", [name + "mk", k(name + "mu2", np.array([3], dtype=np.int64))], [name + "mkv"])  # [N,1,361,1]
+                n("Mul", [v, name + "mkv"], [name + "vm"])
+            else:
+                name = name  # keep names
+                n("Identity", [name + "pk2"], [name + "pkm"]); n("Identity", [v], [name + "vm"])
+            n("MatMul", [name + "pkm", name + "vm"], [name + "kv"])      # [N,H,hd,hd]
+            n("MatMul", [name + "pq", name + "kv"], [name + "av"])       # [N,H,361,hd]
+            n("Transpose", [name + "av"], [name + "avt2"], perm=[0, 1, 3, 2])
+            n("Reshape", [name + "avt2", k(name + "avr", np.array([0, aw, 19, 19], dtype=np.int64))], [name + "av2"])
+            o = conv1x1(name + "av2", aw, inner_, name + "o")
+            n("Add", [x, o], [name + "res"])
+            return name + "res"
         n("MatMul", [qk[0], qk[1]], [name + "sc"])
         if use_mask:
             n("Mul", [name + "sc", k(name + "scs", np.array(1.0 / np.sqrt(hd), dtype=np.float32))], [name + "sc2"])
@@ -167,8 +190,9 @@ if __name__ == "__main__":
     p.add_argument("--no-mask", action="store_true")
     p.add_argument("--attn-width", type=int, default=None)
     p.add_argument("--head-dim", type=int, default=32)
+    p.add_argument("--linear-attn", action="store_true")
     p.add_argument("--out", required=True)
     a = p.parse_args()
-    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim)
+    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim, linear_attn=a.linear_attn)
     print(f"saved {a.out}: {npars/1e6:.2f}M params (C={a.C} inner={a.inner} F={a.F} "
           f"blocks={a.blocks}x{a.sub} heads={a.heads} attn={not a.no_attention})")
