@@ -83,15 +83,24 @@ flowchart TD
 
 ### 2.3 Sub-blocks (pre-norm)
 
-**Attention sub-block** (every `d`-th): RMSNorm -> Q/K/V 1×1 convs (C/2 -> `W_a`,
-`W_a = C/4` in v2 — the width knob — with `H = W_a/32` heads of dim 32) -> reshape/transpose to [N,H,361,32] -> QK^T/sqrt(32)
--> additive board-mask -> softmax -> AV -> transpose/reshape -> output 1×1 conv ->
-residual add. Positional encoding: 2D learned RoPE as in tf3 (cost-neutral; the
-reference generator omits it for speed benchmarking only).
+**Attention sub-block** (every `d`-th, at width `W_a` — the width knob, typically
+C/4 or C/2 — with `H = W_a/32` heads of dim 32). Two variants:
+
+*Softmax:* RMSNorm -> Q/K/V 1×1 convs (C/2 -> `W_a`) -> reshape/transpose to
+[N,H,361,32] -> QK^T/sqrt(32) -> additive board-mask (omit for fixed 19x19) ->
+softmax -> AV -> transpose/reshape -> output 1×1 conv (`W_a` -> C/2) -> residual.
+Positional encoding: 2D learned RoPE as in tf3 (cost-neutral; omitted in the speed
+generator).
+
+*Linear (v3):* φ(x) = elu(x)+1; y = φ(Q) · (φ(K)^T · V), with K's off-board columns
+and V's off-board rows zeroed by the mask when variable boards are needed. Score
+matmuls collapse from O(361²·d) to O(361·d²) — at d=32, ~9% of the FLOPs, no
+softmax, no score mask. Quality on Go is *unmeasured* (the central training
+question; see §3).
 
 **Feed-forward sub-block** (all sub-blocks): RMSNorm -> two 1×1 convs (C/2 -> F and
 C/2 -> F) -> SwiGLU gate (SiLU(x)*y) -> 1×1 conv F -> C/2 -> residual add.
-F = 3 × C/2.
+F ∈ {2×, 3×} × C/2 (the FF-ratio knob — FF dominates FLOPs).
 
 **Op vocabulary (strict):** 1×1/3×3 convolutions (= dense GEMMs, the oneDNN-native
 path), RMSNorm (6 cheap elementwise ops), SiLU, one softmax per attention, matmuls
@@ -100,19 +109,25 @@ pools except the two head pools, no other ops.
 
 ### 2.4 Size ladder (all shapes measured, bf16, standalone)
 
-**v2 levers (Round D/E, measured):** dropping the attention board-mask chain (valid
-at fixed 19x19) +17%; attention width = inner/2 (a second, better cost knob than
-density) +23% more; fused-QKV *rejected* (slice overhead beats GEMM gain); head-dim
-16 *rejected* (batch-8 collapse).
+**v3 levers (Rounds D–G, measured):** dropping the attention board-mask chain (valid
+at fixed 19x19) +17%; attention width = inner/2 +23%; **linear attention**
+(φ(Q)·(φ(K)^T·V), φ = elu+1 — 361×361 score matmuls become 32×32, ~9% of attention
+FLOPs, no softmax, no score mask) a further +7% at every-3 density and enables
+full-density attention at 2/3 the cost; FF ratio F = 2×inner (vs 3×) another +16%
+(FF dominates FLOPs); fused-QKV *rejected* (slice overhead beats GEMM gain); head-dim
+16 *rejected* (batch-8 collapse); nbt2-style sub-count *rejected* (18×2 slower than 12×3).
 
-| Size | C / inner / F | attn (every / width) | Params | b1 pos/s | b8 pos/s |
+| Config | shape | attention | Params | b1 pos/s | b8 pos/s |
 |---|---|---|---|---|---|
-| **CGX-Sv2** | 256 / 128 / 384, 12×3 | 3 / 64 | 6.56M | **92.7** | **131.8** |
-| CGX-Sv2 denser | 256 / 128 / 384, 12×3 | 2 / 64 | 6.76M | 75.5 | 121.1 |
-| CGX-Sv2 full-attn | 256 / 128 / 384, 12×3 | 1 / 64 | 7.35M | 56.6 | 96.1 |
-| **CGX-Mv2** | 384 / 192 / 576, 12×3 | 3 / 96 | 14.71M | **53.8** | 74.3 |
-| CGX-Mv2 denser | 384 / 192 / 576, 12×3 | 2 / 96 | 15.16M | 48.3 | 69.9 |
-| CGX-S v1 (ref) | 256 / 128 / 384, 12×3 | 3 / 128 | 6.96M | 73–86* | 111–121* |
+| **CGX-J** (jetspeed) | C256 i128 F256, 12×3 | linear, every-3, w64 | 4.80M | **116.6** | **193.7** |
+| CGX-S | C256 i128 F384, 12×3 | linear, every-3, w64 | 6.56M | 99.0 | 160.0 |
+| CGX-S full-attn | C256 i128 F384, 12×3 | linear, every-1, w64 | 7.35M | 67.2 | 127.5 |
+| CGX-A | C384 i192 F384, 12×3 | linear, every-3, w64 | 10.44M | 75.5 | 112.0 |
+| CGX-M | C384 i192 F576, 12×3 | softmax, every-3, w64 | 14.42M | 59.8 | 80.8 |
+| CGX-B | C384 i192 F576, 12×3 | linear, every-2, w96 | 15.16M | 52.1 | 76.3 |
+| CGX-L | C512 i256 F768, 10×3 | linear, every-3, w128 | 21.78M | 48.4 | 60.5 |
+| CGX-S softmax ref | C256 i128 F384, 12×3 | softmax, every-3, w64 | 6.96M | 92.7 | 131.8 |
+| CGX-S v1 ref | C256 i128 F384, 12×3 | softmax, every-3, w128 | 6.96M | 73–86* | 111–121* |
 
 *same configuration measured 73.2 and 85.7 in different sessions on the shared box —
 run-to-run variance ~15%; all lever comparisons above were measured within single runs.
@@ -126,11 +141,19 @@ measured 35.8/263 ms (b1/b8) vs the real tf3-b10c512's 38.9/238 ms — within ~1
 
 ### 2.5 Projected engine performance (×0.75 engine efficiency, ×1.085 visits ratio)
 
-| Size | live v/s (est) | analysis v/s (est) | Elo (est, distilled) |
+| Config | live v/s (est) | analysis v/s (est) | vs existing measured nets |
 |---|---|---|---|
-| CGX-Sv2 | **~72** | ~100 | ~13,300–13,700 |
-| CGX-Sv2 denser | ~59 | ~93 | ~13,500–13,900 |
-| CGX-Mv2 | **~42** | ~56 | ~13,800–14,100 |
+| CGX-J | **~91** | ~150 | ~1.9× tf2's measured 48.3 v/s |
+| CGX-S | ~77 | ~124 | ~1.6× tf2 |
+| CGX-A | ~59 | ~87 | ~1.2× tf2, tf2-class params |
+| CGX-M | ~47 | ~63 | tf3-b10c512 class (21.8 measured) |
+| CGX-B / CGX-L | ~38–41 | ~47–59 | — |
+
+Elo: unmeasured until trained (§3). Softmax variants (CGX-M) should anchor near
+tf2-class per-parameter quality; the linear-attention and thin-FF variants trade
+some per-parameter quality for speed — how much is *the* open question, and the
+first thing the training sweep must measure (CGX-M softmax vs CGX-B linear at
+matched cost settles it).
 
 Elo anchors: tf2-b10c384 = 13,712 at 10.5M params / full attention / ~44 engine v/s
 (measured). CGX-M has 1.5× tf2's params but 1/3 attention density; distillation from
@@ -145,9 +168,11 @@ tf3-b11c768 (14,542) is the compensating factor. These are honest projections wi
    graph→PyTorch tooling already exist in `tools/qat-experiments/`).
 2. Standard KataGo training targets as auxiliary losses (the shards contain them).
 3. bf16/fp32 training; **no quantization** (measured: int8 gives 0% on these shapes).
-4. Sweep `attn-every` ∈ {2,3,4} and blocks {10,12,14} on a small compute budget —
-   the speed side of the trade is fully measured above; only the Elo side needs
-   training runs.
+4. Sweep on a small compute budget — the speed side is fully measured above; the
+   training sweep should measure the Elo side of: attention type {softmax, linear} ×
+   density {every-2, every-3} × width {C/4, C/2} × F ratio {2×, 3×} at ~12 blocks.
+   First experiment: CGX-M (softmax) vs CGX-B (linear) at matched cost — it settles
+   the linear-attention question for Go.
 
 ## 4. What was tested and rejected (measured)
 
