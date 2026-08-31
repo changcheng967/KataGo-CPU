@@ -110,6 +110,25 @@ The one genuine remaining lever is custom fused-attention kernels for the transf
 nets (potential +15–30%, bounded by the instruction ceiling) — a from-scratch kernel
 project.
 
+## Transformer kernel profiling (why there is little left to fuse)
+
+Per-op profiling (`PERF_COUNT`, OpenVINO) of tf3-b11c768, batch 1 / batch 8:
+
+| op class | b1 share | b8 share | state |
+|---|---|---|---|
+| FullyConnected (QKV/FFN GEMMs) | 74.3% | 68.6% | dense GEMM at practical peak — physics |
+| attention `sv` Subgraph | 12.8% | 16.7% | **already fused by OpenVINO** (scores+softmax+values); remaining cost is structural to the 361×361×heads shapes |
+| elementwise glue (SiLU muls, norms, gathers, reorders) | ~10% | ~13% | partially fused by OV snippets; the only addressable slice |
+
+The graph layout was also A/B-tested: `onnxTransformerNHWC = false` (NCHW) is
+**10–19% slower** on every transformer model — the NHWC default is optimal.
+
+Conclusion: a hand-written fused-attention kernel has little to recover (the runtime
+already emits fused attention subgraphs); the realistic custom-kernel target is the
+~10% elementwise glue via an OpenVINO extension with real AVX-512 microkernels —
+estimated +5–7% end-to-end for a multi-week kernel project.
+
+
 All handles share one `ov::Core` and one `CompiledModel` per model (single OpenVINO
 thread pool, single graph compilation per process); each NN-server thread takes its
 own `InferRequest` from it.
