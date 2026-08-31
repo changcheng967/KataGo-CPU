@@ -25,6 +25,11 @@
 #include "../neuralnet/onnxmodelbuilder.h"
 
 #include <onnxruntime_cxx_api.h>
+#ifdef KATAGO_OV_NATIVE
+#include <openvino/openvino.hpp>
+#include <filesystem>
+#include <system_error>
+#endif
 #ifdef __APPLE__
 #include <coreml_provider_factory.h>
 #endif
@@ -54,7 +59,7 @@ using namespace std;
 // Exposing a new provider takes an entry here plus an AppendExecutionProvider_* branch in
 // ComputeHandle.
 static const char* const kKnownProviders[] = {
-  "cpu", "openvino", "cuda", "tensorrt", "migraphx", "coreml", "directml",
+  "cpu", "ov", "openvino", "cuda", "tensorrt", "migraphx", "coreml", "directml",
 };
 
 //--------------------------------------------------------------
@@ -148,7 +153,8 @@ static string getRequiredProviderLowercase(ConfigParser& cfg) {
   if(!cfg.contains("onnxProvider"))
     throw StringError(
       "ONNX backend: onnxProvider is not set in the config. Set it to choose what hardware runs "
-      "the neural net: openvino (Intel GPUs and NPUs), directml (DirectX 12 GPUs, Windows only), "
+      "the neural net: ov (native OpenVINO runtime, best on CPU), openvino (Intel GPUs and NPUs), "
+      "directml (DirectX 12 GPUs, Windows only), "
       "cuda or tensorrt (NVIDIA GPUs), migraphx (AMD GPUs, Linux only), or cpu (no GPU or NPU, "
       "slow).");
   return Global::toLower(cfg.getString("onnxProvider"));
@@ -166,6 +172,7 @@ struct ComputeContext {
   // Optional OpenVINO provider options (empty = not passed to ORT)
   string openvinoPrecision;   // FP16 / FP32 / ACCURACY (GPU only; the NPU is FP16-only)
   string openvinoNumStreams;  // 1-8
+  int ovNumThreads;            // -1 = OpenVINO default; >0 pins INFERENCE_NUM_THREADS (provider 'ov')
   bool transformerNHWC;         // run the trunk block stack channel-last (NHWC)
   bool skipScale8;              // skip the scale8 FP16-range workaround (see createComputeContext)
   // Pad every inference up to the max batch size so the graph only ever sees one input shape.
@@ -186,6 +193,7 @@ struct ComputeContext {
       openvinoCacheDir(""),
       openvinoPrecision(""),
       openvinoNumStreams(""),
+      ovNumThreads(-1),
       transformerNHWC(true),
       skipScale8(false),
       padBatchMode(enabled_t::Auto)
@@ -228,6 +236,7 @@ ComputeContext* NeuralNet::createComputeContext(
   ctx->openvinoCacheDir = cfg.contains("onnxOpenVINOCacheDir") ? cfg.getString("onnxOpenVINOCacheDir") : "";
   ctx->openvinoPrecision = cfg.contains("onnxOpenVINOPrecision") ? cfg.getString("onnxOpenVINOPrecision") : "";
   ctx->openvinoNumStreams = cfg.contains("onnxOpenVINONumStreams") ? cfg.getString("onnxOpenVINONumStreams") : "";
+  ctx->ovNumThreads = cfg.contains("onnxOVThreads") ? cfg.getInt("onnxOVThreads", 1, 1024) : -1;
   ctx->padBatchMode = cfg.contains("onnxPadBatch") ? cfg.getEnabled("onnxPadBatch") : enabled_t::Auto;
 
   // useFP16 = false is an explicit request for full FP32 on every other backend. The only
@@ -422,6 +431,15 @@ static bool shouldPadBatch(const ComputeContext* ctx, int serverThreadIdx) {
 struct ComputeHandle {
   ComputeContext* ctx;
   std::unique_ptr<Ort::Session> session;
+#ifdef KATAGO_OV_NATIVE
+  // Native OpenVINO execution (provider "ov"): same graph bytes, executed by the
+  // OpenVINO runtime instead of ORT. On AVX512_BF16 CPUs this gives the bf16 oneDNN
+  // kernels, which are several times faster than the CPU provider's MLAS kernels.
+  std::shared_ptr<ov::Core> ovCore;
+  std::shared_ptr<ov::CompiledModel> ovCompiled;
+  std::shared_ptr<ov::InferRequest> ovRequest;
+  bool useOVNative = false;
+#endif
   int modelVersion;
   int numInputChannels;
   int numInputGlobalChannels;
@@ -729,28 +747,97 @@ struct ComputeHandle {
       if(logger != NULL)
         logger->write("ONNX backend: using CPU execution provider");
     }
+    else if(provider == "ov") {
+#ifdef KATAGO_OV_NATIVE
+      useOVNative = true;
+      if(logger != NULL)
+        logger->write("ONNX backend: using native OpenVINO execution (provider 'ov')");
+#else
+      throw StringError(
+        "ONNX backend: onnxProvider 'ov' requires building with -DUSE_OV_NATIVE=1 and -DOV_ROOT=<openvino install>");
+#endif
+    }
     else {
       throw StringError("ONNX backend: unknown onnxProvider '" + provider + "'");
     }
 
-    session = std::make_unique<Ort::Session>(ctx->env, onnxBytes.data(), onnxBytes.size(), sessionOpts);
-
-    Ort::AllocatorWithDefaultOptions allocator;
-    size_t numInputs = session->GetInputCount();
-    for(size_t i = 0; i < numInputs; i++) {
-      Ort::AllocatedStringPtr name = session->GetInputNameAllocated(i, allocator);
-      inputNames.push_back(name.get());
+    size_t numInputs = 0;
+    size_t numOutputs = 0;
+#ifdef KATAGO_OV_NATIVE
+    if(useOVNative) {
+      ovCore = std::make_shared<ov::Core>();
+      ov::AnyMap ovProps;
+      if(ctx->ovNumThreads > 0)
+        ovProps["INFERENCE_NUM_THREADS"] = std::to_string(ctx->ovNumThreads);
+      {
+        // Map the shared precision setting; "undefined" lets the plugin pick
+        // (bf16 on AVX512_BF16 CPUs, which is the fast and validated default).
+        string p = Global::toLower(ctx->openvinoPrecision);
+        if(p == "fp16") p = "f16";
+        else if(p == "fp32") p = "f32";
+        else if(p == "bf16") p = "bf16";
+        else p = "undefined";
+        ovProps["INFERENCE_PRECISION_HINT"] = p;
+      }
+      ovCore->set_property("CPU", ovProps);
+      // OpenVINO's read_model only accepts file paths, so stage the graph bytes in a
+      // temp file (one per server thread, deleted right after loading).
+      std::filesystem::path tmpModelPath = std::filesystem::temp_directory_path() /
+        ("katago_ov_model_" + std::to_string(serverThreadIdx < 0 ? 0 : serverThreadIdx) + ".onnx");
+      {
+        std::ofstream f(tmpModelPath, std::ios::binary);
+        f.write(onnxBytes.data(), (std::streamsize)onnxBytes.size());
+        if(!f.good())
+          throw StringError("ONNX backend: failed to write temp model file for OpenVINO at " + tmpModelPath.string());
+      }
+      std::shared_ptr<ov::Model> ovModel;
+      try {
+        ovModel = ovCore->read_model(tmpModelPath.string());
+      }
+      catch(...) {
+        std::error_code ec;
+        std::filesystem::remove(tmpModelPath, ec);
+        throw;
+      }
+      {
+        std::error_code ec;
+        std::filesystem::remove(tmpModelPath, ec);
+      }
+      ovCompiled = std::make_shared<ov::CompiledModel>(ovCore->compile_model(ovModel, "CPU"));
+      ovRequest = std::make_shared<ov::InferRequest>(ovCompiled->create_infer_request());
+      for(const auto& in : ovModel->inputs())
+        inputNames.push_back(in.get_any_name());
+      for(const auto& out : ovModel->outputs())
+        outputNames.push_back(out.get_any_name());
+      for(auto& n : inputNames)
+        inputNamePtrs.push_back(n.c_str());
+      for(auto& n : outputNames)
+        outputNamePtrs.push_back(n.c_str());
+      numInputs = inputNames.size();
+      numOutputs = outputNames.size();
     }
-    for(auto& n : inputNames)
-      inputNamePtrs.push_back(n.c_str());
+    else
+#endif
+    {
+      session = std::make_unique<Ort::Session>(ctx->env, onnxBytes.data(), onnxBytes.size(), sessionOpts);
 
-    size_t numOutputs = session->GetOutputCount();
-    for(size_t i = 0; i < numOutputs; i++) {
-      Ort::AllocatedStringPtr name = session->GetOutputNameAllocated(i, allocator);
-      outputNames.push_back(name.get());
+      Ort::AllocatorWithDefaultOptions allocator;
+      numInputs = session->GetInputCount();
+      for(size_t i = 0; i < numInputs; i++) {
+        Ort::AllocatedStringPtr name = session->GetInputNameAllocated(i, allocator);
+        inputNames.push_back(name.get());
+      }
+      for(auto& n : inputNames)
+        inputNamePtrs.push_back(n.c_str());
+
+      numOutputs = session->GetOutputCount();
+      for(size_t i = 0; i < numOutputs; i++) {
+        Ort::AllocatedStringPtr name = session->GetOutputNameAllocated(i, allocator);
+        outputNames.push_back(name.get());
+      }
+      for(auto& n : outputNames)
+        outputNamePtrs.push_back(n.c_str());
     }
-    for(auto& n : outputNames)
-      outputNamePtrs.push_back(n.c_str());
 
     if(logger != NULL) {
       // The graph input/output orders are identical for every server thread, so log them once.
@@ -992,6 +1079,30 @@ void NeuralNet::getOutput(
         inputBuffers->metaInput.data() + inputBuffers->singleInputMetaElts * nIdx);
   }
 
+  // BENCH-PATCH: dump real input rows for calibration (env KATAGO_DUMP_INPUTS)
+  {
+    static FILE* dumpFile = NULL;
+    static long dumpRows = 0;
+    static long dumpCap = 0;
+    if(dumpFile == NULL && dumpCap == 0) {
+      const char* dumpPath = getenv("KATAGO_DUMP_INPUTS");
+      if(dumpPath != NULL && dumpPath[0] != '\0') {
+        dumpFile = fopen(dumpPath, "wb");
+        dumpCap = 2048;
+        if(dumpFile == NULL) { fprintf(stderr, "KATAGO_DUMP_INPUTS: cannot open %s\n", dumpPath); dumpCap = -1; }
+      }
+    }
+    if(dumpFile != NULL && dumpRows < dumpCap) {
+      for(int dumpIdx = 0; dumpIdx < runBatchSize && dumpRows < dumpCap; dumpIdx++) {
+        fwrite(inputBuffers->maskInput.data() + inputBuffers->singleMaskElts * dumpIdx, sizeof(float), inputBuffers->singleMaskElts, dumpFile);
+        fwrite(inputBuffers->spatialInput.data() + inputBuffers->singleInputElts * dumpIdx, sizeof(float), inputBuffers->singleInputElts, dumpFile);
+        fwrite(inputBuffers->globalInput.data() + inputBuffers->singleInputGlobalElts * dumpIdx, sizeof(float), inputBuffers->singleInputGlobalElts, dumpFile);
+        dumpRows++;
+      }
+      fflush(dumpFile);
+    }
+  }
+
   // Build Ort::Value views over the host buffers. These stay in CPU memory - the execution
   // provider copies to device internally and returns outputs in CPU memory.
   Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -1049,14 +1160,6 @@ void NeuralNet::getOutput(
                         "' -- only InputMask/InputSpatial/InputGlobal/InputMeta are supported");
   }
 
-  auto outputTensors = gpuHandle->session->Run(
-    Ort::RunOptions{nullptr},
-    gpuHandle->inputNamePtrs.data(),
-    inputTensors.data(),
-    inputTensors.size(),
-    gpuHandle->outputNamePtrs.data(),
-    gpuHandle->outputNamePtrs.size());
-
   int policyPassIdx = findNameIndex(gpuHandle->outputNames, {"OutputPolicyPass"});
   int policyIdx = findNameIndex(gpuHandle->outputNames, {"OutputPolicy"});
   int valueIdx = findNameIndex(gpuHandle->outputNames, {"OutputValue"});
@@ -1067,11 +1170,66 @@ void NeuralNet::getOutput(
       "ONNX backend: graph is missing expected outputs "
       "(OutputPolicyPass/OutputPolicy/OutputValue/OutputScoreValue/OutputOwnership)");
 
-  const float* policyPassData = outputTensors[policyPassIdx].GetTensorData<float>();
-  const float* policyData = outputTensors[policyIdx].GetTensorData<float>();
-  const float* valueData = outputTensors[valueIdx].GetTensorData<float>();
-  const float* scoreValueData = outputTensors[scoreValueIdx].GetTensorData<float>();
-  const float* ownershipData = outputTensors[ownershipIdx].GetTensorData<float>();
+  const float* policyPassData;
+  const float* policyData;
+  const float* valueData;
+  const float* scoreValueData;
+  const float* ownershipData;
+#ifdef KATAGO_OV_NATIVE
+  if(gpuHandle->useOVNative) {
+    // Zero-copy: wrap the same host buffers that the ORT path views as Ort::Values.
+    for(size_t i = 0; i < gpuHandle->inputNames.size(); i++) {
+      const std::array<int64_t,4>* sh = nullptr;
+      float* data = nullptr;
+      if((int)i == maskIdx) {
+        sh = &maskShape;
+        data = inputBuffers->maskInput.data();
+      }
+      else if((int)i == spatialIdx) {
+        sh = &spatialShape;
+        data = inputBuffers->spatialInput.data();
+      }
+      else if((int)i == globalIdx) {
+        sh = &globalShape;
+        data = inputBuffers->globalInput.data();
+      }
+      else if((int)i == metaIdx) {
+        sh = &metaShape;
+        data = inputBuffers->metaInput.data();
+      }
+      else
+        throw StringError("ONNX backend: unexpected graph input '" + gpuHandle->inputNames[i] +
+                          "' -- only InputMask/InputSpatial/InputGlobal/InputMeta are supported");
+      ov::Shape shape(sh->begin(), sh->end());
+      gpuHandle->ovRequest->set_tensor(gpuHandle->inputNames[i], ov::Tensor(ov::element::f32, shape, (void*)data));
+    }
+    gpuHandle->ovRequest->infer();
+    auto outPtr = [&](int idx) -> const float* {
+      ov::Tensor t = gpuHandle->ovRequest->get_tensor(gpuHandle->outputNames[idx]);
+      return (const float*)t.data();
+    };
+    policyPassData = outPtr(policyPassIdx);
+    policyData = outPtr(policyIdx);
+    valueData = outPtr(valueIdx);
+    scoreValueData = outPtr(scoreValueIdx);
+    ownershipData = outPtr(ownershipIdx);
+  }
+  else
+#endif
+  {
+    auto outputTensors = gpuHandle->session->Run(
+      Ort::RunOptions{nullptr},
+      gpuHandle->inputNamePtrs.data(),
+      inputTensors.data(),
+      inputTensors.size(),
+      gpuHandle->outputNamePtrs.data(),
+      gpuHandle->outputNamePtrs.size());
+    policyPassData = outputTensors[policyPassIdx].GetTensorData<float>();
+    policyData = outputTensors[policyIdx].GetTensorData<float>();
+    valueData = outputTensors[valueIdx].GetTensorData<float>();
+    scoreValueData = outputTensors[scoreValueIdx].GetTensorData<float>();
+    ownershipData = outputTensors[ownershipIdx].GetTensorData<float>();
+  }
 
   assert(policyPassData != nullptr);
   assert(policyData != nullptr);

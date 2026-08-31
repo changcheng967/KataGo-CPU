@@ -1696,6 +1696,24 @@ elseif(USE_BACKEND STREQUAL "ONNX")
   endif()
   target_link_libraries(katago ${ONNXRUNTIME_LIB})
 
+  # Native OpenVINO execution path in the ONNX backend (onnxProvider = ov).
+  # OV_ROOT must point at an OpenVINO install containing include/ and libs/
+  # (the pip wheel layout works: .../site-packages/openvino).
+  option(USE_OV_NATIVE "Enable native OpenVINO execution in the ONNX backend (provider 'ov')" OFF)
+  if(USE_OV_NATIVE)
+    if(NOT DEFINED OV_ROOT OR NOT IS_DIRECTORY "${OV_ROOT}")
+      message(FATAL_ERROR "USE_OV_NATIVE requires -DOV_ROOT=<OpenVINO install containing include/ and libs/>")
+    endif()
+    target_compile_definitions(katago PRIVATE KATAGO_OV_NATIVE=1)
+    target_include_directories(katago PRIVATE "${OV_ROOT}/include")
+    find_library(OPENVINO_LIB NAMES openvino HINTS "${OV_ROOT}/libs" NO_DEFAULT_PATH)
+    if(NOT OPENVINO_LIB OR OPENVINO_LIB STREQUAL "OPENVINO_LIB-NOTFOUND")
+      message(FATAL_ERROR "Could not find libopenvino under ${OV_ROOT}/libs")
+    endif()
+    target_link_libraries(katago ${OPENVINO_LIB})
+    message(STATUS "ONNX backend: native OpenVINO execution enabled (${OPENVINO_LIB})")
+  endif()
+
   # The ONNX emitter whose bytes go to Ort::Session, and the protobuf it needs, are set up in the
   # shared block after this backend chain. Protobuf and protoc must be findable by
   # find_package(Protobuf); for an ORT built from source they live under its _deps/protobuf-build.

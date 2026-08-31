@@ -93,6 +93,8 @@ Use `brew install katago`. The latest config files and networks are installed in
 ### OpenCL vs CUDA vs TensorRT vs ROCm vs ONNX vs Eigen
 KataGo has six backends, OpenCL (GPU), CUDA (GPU), TensorRT (GPU), ROCm (GPU), ONNX Runtime (varied hardware), and Eigen (CPU). (On macOS there is also a Metal backend, most easily obtained via homebrew - see above.)
 
+**CPU-only users:** this fork adds a native OpenVINO execution provider (`onnxProvider = ov`) to the ONNX backend — bf16 oneDNN kernels, up to 3.7x faster play than the stock `cpu` provider and stronger than Eigen, verified against the Eigen fp32 reference to 0.15% of `testgpuerror`'s tolerance. See **[docs/CPU_BACKEND.md](docs/CPU_BACKEND.md)** for build instructions, config, and measured results for the conv and transformer nets (short version: the tf3 transformer nets are by far the strongest CPU models).
+
 As of v1.17, KataGo supports transformer neural nets, which are generally much stronger for the same compute cost and which the main training run is switching to. Transformer models are more demanding on the GPU backend than the older convolutional nets, so the backend recommendations below matter more for them - in particular OpenCL is noticeably slower on transformers, and on NVIDIA the CUDNN and TensorRT versions make a large difference.
 
 The quick summary is:
