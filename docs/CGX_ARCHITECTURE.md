@@ -83,8 +83,8 @@ flowchart TD
 
 ### 2.3 Sub-blocks (pre-norm)
 
-**Attention sub-block** (every `d`-th): RMSNorm -> Q/K/V 1×1 convs (C/2 -> C/2,
-`H = (C/2)/32` heads of dim 32) -> reshape/transpose to [N,H,361,32] -> QK^T/sqrt(32)
+**Attention sub-block** (every `d`-th): RMSNorm -> Q/K/V 1×1 convs (C/2 -> `W_a`,
+`W_a = C/4` in v2 — the width knob — with `H = W_a/32` heads of dim 32) -> reshape/transpose to [N,H,361,32] -> QK^T/sqrt(32)
 -> additive board-mask -> softmax -> AV -> transpose/reshape -> output 1×1 conv ->
 residual add. Positional encoding: 2D learned RoPE as in tf3 (cost-neutral; the
 reference generator omits it for speed benchmarking only).
@@ -100,13 +100,26 @@ pools except the two head pools, no other ops.
 
 ### 2.4 Size ladder (all shapes measured, bf16, standalone)
 
-| Size | C / inner / F | Blocks × sub | attn-every | attention layers | Params | GFLOP/eval | b1 pos/s | b8 pos/s |
-|---|---|---|---|---|---|---|---|---|
-| **CGX-S** | 256 / 128 / 384 | 12 × 3 | 3 | 12 | 6.96M | 5.8 | **85.7** | 120.7 |
-| CGX-S full-attn | 256 / 128 / 384 | 12 × 3 | 1 | 36 | 8.53M | 8.5 | 48.8 | 73.0 |
-| **CGX-M** | 384 / 192 / 576 | 12 × 3 | 3 | 12 | 15.6M | 12.4 | **48.1** | 65.1 |
-| CGX-M full-attn | 384 / 192 / 576 | 10 × 3 | 1 | 30 | 16.0M | 14.5 | 35.0 | 47.8 |
-| CGX-L | 512 / 256 / 768 | 10 × 3 | 3 | 10 | ~27M | ~17 | ~28 (est) | ~40 (est) |
+**v2 levers (Round D/E, measured):** dropping the attention board-mask chain (valid
+at fixed 19x19) +17%; attention width = inner/2 (a second, better cost knob than
+density) +23% more; fused-QKV *rejected* (slice overhead beats GEMM gain); head-dim
+16 *rejected* (batch-8 collapse).
+
+| Size | C / inner / F | attn (every / width) | Params | b1 pos/s | b8 pos/s |
+|---|---|---|---|---|---|
+| **CGX-Sv2** | 256 / 128 / 384, 12×3 | 3 / 64 | 6.56M | **92.7** | **131.8** |
+| CGX-Sv2 denser | 256 / 128 / 384, 12×3 | 2 / 64 | 6.76M | 75.5 | 121.1 |
+| CGX-Sv2 full-attn | 256 / 128 / 384, 12×3 | 1 / 64 | 7.35M | 56.6 | 96.1 |
+| **CGX-Mv2** | 384 / 192 / 576, 12×3 | 3 / 96 | 14.71M | **53.8** | 74.3 |
+| CGX-Mv2 denser | 384 / 192 / 576, 12×3 | 2 / 96 | 15.16M | 48.3 | 69.9 |
+| CGX-S v1 (ref) | 256 / 128 / 384, 12×3 | 3 / 128 | 6.96M | 73–86* | 111–121* |
+
+*same configuration measured 73.2 and 85.7 in different sessions on the shared box —
+run-to-run variance ~15%; all lever comparisons above were measured within single runs.
+
+Note on mask-free: the additive off-board mask chain is dead code at exactly 19x19
+(the mask is constant). A mask-free net is only correct for fixed 19x19 play; keep
+the mask (5 ops/attention) if smaller boards must be supported.
 
 Validation of the generator: the full-attention C512/i256/F768/10×3 reference
 measured 35.8/263 ms (b1/b8) vs the real tf3-b10c512's 38.9/238 ms — within ~10%.
@@ -115,9 +128,9 @@ measured 35.8/263 ms (b1/b8) vs the real tf3-b10c512's 38.9/238 ms — within ~1
 
 | Size | live v/s (est) | analysis v/s (est) | Elo (est, distilled) |
 |---|---|---|---|
-| CGX-S | **~65** | ~95 | ~13,400–13,700 |
-| CGX-M | ~36 | ~50 | ~13,800–14,100 |
-| CGX-L | ~21 | ~31 | ~14,100–14,300 |
+| CGX-Sv2 | **~72** | ~100 | ~13,300–13,700 |
+| CGX-Sv2 denser | ~59 | ~93 | ~13,500–13,900 |
+| CGX-Mv2 | **~42** | ~56 | ~13,800–14,100 |
 
 Elo anchors: tf2-b10c384 = 13,712 at 10.5M params / full attention / ~44 engine v/s
 (measured). CGX-M has 1.5× tf2's params but 1/3 attention density; distillation from

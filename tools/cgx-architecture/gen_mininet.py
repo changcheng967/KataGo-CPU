@@ -9,7 +9,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 
-def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1):
+def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32):
     rng = np.random.default_rng(seed)
     inits, nodes = [], []
 
@@ -43,29 +43,44 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
         n("Conv", [x, w(name + "w", (cout, cin, 1, 1))], [name + "o"])
         return name + "o"
 
-    def attention_sub(x, inner_, heads_, name):
+    def attention_sub(x, inner_, name):
+        aw = attn_width if attn_width else inner_
+        hd = head_dim
+        nh = aw // hd
         h = rmsnorm(x, inner_, name + "n")
+        if fused_qkv:
+            qkv = conv1x1(h, inner_, 3 * aw, name + "qkv")
+            parts = []
+            for i, t in enumerate("qkv"):
+                n("Slice", [qkv, k(name + t + "st", np.array([i * aw], dtype=np.int64)),
+                            k(name + t + "en", np.array([(i + 1) * aw], dtype=np.int64)),
+                            k(name + t + "ax", np.array([1], dtype=np.int64))], [name + t + "sl"])
+                parts.append(name + t + "sl")
+        else:
+            parts = [conv1x1(h, inner_, aw, name + t) for t in "qkv"]
         qk = []
-        for t in "qkv":
-            v = conv1x1(h, inner_, inner_, name + t)
-            n("Reshape", [v, k(name + t + "r", np.array([0, heads_, 32, 361], dtype=np.int64))], [name + t + "rs"])
+        for t, v in zip("qkv", parts):
+            n("Reshape", [v, k(name + t + "r", np.array([0, nh, hd, 361], dtype=np.int64))], [name + t + "rs"])
             if t == "k":
                 qk.append(name + t + "rs")
             else:
                 n("Transpose", [name + t + "rs"], [name + t + "th"], perm=[0, 1, 3, 2])
                 qk.append(name + t + "th")
         n("MatMul", [qk[0], qk[1]], [name + "sc"])
-        n("Mul", [name + "sc", k(name + "scs", np.array(1.0 / 32.0, dtype=np.float32))], [name + "sc2"])
-        n("Reshape", [mask_in, k(name + "mr", np.array([0, 1, 361], dtype=np.int64))], [name + "mk"])
-        n("Sub", [name + "mk", k(name + "m1", np.array(1.0, dtype=np.float32))], [name + "mk0"])
-        n("Mul", [name + "mk0", k(name + "mb", np.array(1e4, dtype=np.float32))], [name + "mneg"])
-        n("Unsqueeze", [name + "mneg", k(name + "mu", np.array([2], dtype=np.int64))], [name + "muo"])
-        n("Add", [name + "sc2", name + "muo"], [name + "scm"])
+        if use_mask:
+            n("Mul", [name + "sc", k(name + "scs", np.array(1.0 / np.sqrt(hd), dtype=np.float32))], [name + "sc2"])
+            n("Reshape", [mask_in, k(name + "mr", np.array([0, 1, 361], dtype=np.int64))], [name + "mk"])
+            n("Sub", [name + "mk", k(name + "m1", np.array(1.0, dtype=np.float32))], [name + "mk0"])
+            n("Mul", [name + "mk0", k(name + "mb", np.array(1e4, dtype=np.float32))], [name + "mneg"])
+            n("Unsqueeze", [name + "mneg", k(name + "mu", np.array([2], dtype=np.int64))], [name + "muo"])
+            n("Add", [name + "sc2", name + "muo"], [name + "scm"])
+        else:
+            n("Mul", [name + "sc", k(name + "scs", np.array(1.0 / np.sqrt(hd), dtype=np.float32))], [name + "scm"])
         n("Softmax", [name + "scm"], [name + "sm"], axis=-1)
         n("MatMul", [name + "sm", qk[2]], [name + "av"])
         n("Transpose", [name + "av"], [name + "avt2"], perm=[0, 1, 3, 2])
-        n("Reshape", [name + "avt2", k(name + "avr", np.array([0, inner_, 19, 19], dtype=np.int64))], [name + "av2"])
-        o = conv1x1(name + "av2", inner_, inner_, name + "o")
+        n("Reshape", [name + "avt2", k(name + "avr", np.array([0, aw, 19, 19], dtype=np.int64))], [name + "av2"])
+        o = conv1x1(name + "av2", aw, inner_, name + "o")
         n("Add", [x, o], [name + "res"])
         return name + "res"
 
@@ -96,7 +111,7 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
         y = xb
         for s in range(n_sub):
             if attention and (b * n_sub + s) % attn_every == 0:
-                y = attention_sub(y, inner, heads, f"b{b}s{s}a")
+                y = attention_sub(y, inner, f"b{b}s{s}a")
             y = ff_sub(y, inner, F, f"b{b}s{s}f")
         y = rmsnorm(y, inner, f"b{b}qn")
         y = silu(y, f"b{b}qa")
@@ -148,8 +163,12 @@ if __name__ == "__main__":
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--no-attention", action="store_true")
     p.add_argument("--attn-every", type=int, default=1)
+    p.add_argument("--fused-qkv", action="store_true")
+    p.add_argument("--no-mask", action="store_true")
+    p.add_argument("--attn-width", type=int, default=None)
+    p.add_argument("--head-dim", type=int, default=32)
     p.add_argument("--out", required=True)
     a = p.parse_args()
-    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every)
+    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim)
     print(f"saved {a.out}: {npars/1e6:.2f}M params (C={a.C} inner={a.inner} F={a.F} "
           f"blocks={a.blocks}x{a.sub} heads={a.heads} attn={not a.no_attention})")
