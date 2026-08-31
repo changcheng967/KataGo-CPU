@@ -151,6 +151,30 @@ bf16 keeps 98.8%. Weight-only int8 (`compress_weights`) preserves accuracy but g
 no speedup on this runtime. Clean int8 would require QAT. The transformer nets are
 the better CPU investment: they beat every convnet precision trick at stock bf16.
 
+### QAT/distillation investigation and OpenVINO int8 fusion bug (2026-08-31)
+
+A full QAT pipeline was built: the b18 graph converted to PyTorch (validated to
+≤9e-6 vs OpenVINO fp32), per-tensor-u8/per-channel-s8 fake-quant wrappers with
+straight-through estimation, calibrated on 512 real kata1 training positions
+(katagoarchive.org daily shards), distilled from the fp32 teacher.
+
+- The calibrated (untrained) fake-quant net measures **94.9% best-move agreement /
+  0.33% mean winrate error in PyTorch** — real headroom above the ~90% PTQ plateau.
+- Gradient QAT as configured (Adam, batch 16) degraded the model and was stopped.
+- **Export to OpenVINO is blocked by an int8 fusion bug**: with quantization on a
+  nested-bottleneck block's 1×1 boundary convs (`normactconvp` + `normactconvq`),
+  PyTorch computes 96.9% best-move agreement while the numerically-identical OV
+  FQ graph computes 53.1%. Probes confirm OV applies the FakeQuantize operations
+  bit-exactly at the intended edges, yet the compiled result diverges — the
+  low-precision fusion itself miscompiles this pattern (OV 2026.3.1 CPU plugin).
+  Minimal repro: `scripts/torch_pq_probe.py` (PyTorch) vs `scripts/bisect_export.py
+  "model.blocks.0.normactconvq.conv,model.blocks.0.normactconvp.conv"` (OV).
+- Deployable status quo stands: NNCF's own placement (which avoids the broken
+  pattern) reaches ~90% at int8 speed; the 94.9% recipe becomes deployable when
+  the runtime compiles QDQ/FQ exactly (fixed OpenVINO, or a runtime with exact
+  QDQ semantics).
+
+
 ## Benchmarking methodology
 
 Speed: `katago benchmark -t 8 -v <visits> -n <positions>`, medians over multiple runs.
