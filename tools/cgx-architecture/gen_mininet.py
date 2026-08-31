@@ -9,7 +9,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 
-def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32, linear_attn=False):
+def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32, linear_attn=False, no_nbt=False, stem=3):
     rng = np.random.default_rng(seed)
     inits, nodes = [], []
 
@@ -119,7 +119,10 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
 
     mask_in = "mask"
     # ---- stem
-    n("Conv", ["spatial", w("stemw", (C, 22, 3, 3))], ["s1"], pads=[1, 1, 1, 1])
+    if stem == 3:
+        n("Conv", ["spatial", w("stemw", (C, 22, 3, 3))], ["s1"], pads=[1, 1, 1, 1])
+    else:
+        n("Conv", ["spatial", w("stemw", (C, 22, 5, 5))], ["s1"], pads=[2, 2, 2, 2])
     n("Reshape", ["global", k("gr", np.array([0, 19], dtype=np.int64))], ["g2"])
     n("MatMul", ["g2", w("gw", (19, C))], ["g3"])
     n("Reshape", ["g3", k("gr2", np.array([-1, C, 1, 1], dtype=np.int64))], ["g4"])
@@ -128,18 +131,27 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
     x = "x0"
     for b in range(n_blocks):
         res = x
-        xb = rmsnorm(x, C, f"b{b}pn")
-        xb = silu(xb, f"b{b}pa")
-        xb = conv1x1(xb, C, inner, f"b{b}p")
-        y = xb
-        for s in range(n_sub):
-            if attention and (b * n_sub + s) % attn_every == 0:
-                y = attention_sub(y, inner, f"b{b}s{s}a")
-            y = ff_sub(y, inner, F, f"b{b}s{s}f")
-        y = rmsnorm(y, inner, f"b{b}qn")
-        y = silu(y, f"b{b}qa")
-        y = conv1x1(y, inner, C, f"b{b}q")
-        n("Add", [res, y], [f"b{b}o"])
+        if no_nbt:
+            wdt, ff_in = C, F
+            y = x
+            for s in range(n_sub):
+                if attention and (b * n_sub + s) % attn_every == 0:
+                    y = attention_sub(y, C, f"b{b}s{s}a")
+                y = ff_sub(y, C, F, f"b{b}s{s}f")
+            n("Add", [res, y], [f"b{b}o"])
+        else:
+            xb = rmsnorm(x, C, f"b{b}pn")
+            xb = silu(xb, f"b{b}pa")
+            xb = conv1x1(xb, C, inner, f"b{b}p")
+            y = xb
+            for s in range(n_sub):
+                if attention and (b * n_sub + s) % attn_every == 0:
+                    y = attention_sub(y, inner, f"b{b}s{s}a")
+                y = ff_sub(y, inner, F, f"b{b}s{s}f")
+            y = rmsnorm(y, inner, f"b{b}qn")
+            y = silu(y, f"b{b}qa")
+            y = conv1x1(y, inner, C, f"b{b}q")
+            n("Add", [res, y], [f"b{b}o"])
         x = f"b{b}o"
 
     x = rmsnorm(x, C, "tipn")
@@ -191,8 +203,10 @@ if __name__ == "__main__":
     p.add_argument("--attn-width", type=int, default=None)
     p.add_argument("--head-dim", type=int, default=32)
     p.add_argument("--linear-attn", action="store_true")
+    p.add_argument("--no-nbt", action="store_true")
+    p.add_argument("--stem", type=int, default=3)
     p.add_argument("--out", required=True)
     a = p.parse_args()
-    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim, linear_attn=a.linear_attn)
+    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim, linear_attn=a.linear_attn, no_nbt=a.no_nbt, stem=a.stem)
     print(f"saved {a.out}: {npars/1e6:.2f}M params (C={a.C} inner={a.inner} F={a.F} "
           f"blocks={a.blocks}x{a.sub} heads={a.heads} attn={not a.no_attention})")

@@ -116,6 +116,12 @@ FLOPs, no softmax, no score mask) a further +7% at every-3 density and enables
 full-density attention at 2/3 the cost; FF ratio F = 2×inner (vs 3×) another +16%
 (FF dominates FLOPs); fused-QKV *rejected* (slice overhead beats GEMM gain); head-dim
 16 *rejected* (batch-8 collapse); nbt2-style sub-count *rejected* (18×2 slower than 12×3).
+**Round H/I verdicts:** nbt wrapper *confirmed* (wrapper-free loses on both speed and
+params — the FF width reduction pays for the p/q projections several times over);
+head-dim 64 vs 32 *neutral* (free choice for training quality); 5×5 stem *neutral*;
+depth > 12 blocks *rejected* again (16 blocks: 88.5 vs 12: 99.9); misaligned widths
+(C320) *rejected* (GEMM efficiency drop); attention every-4 at F=3× ≈ every-3
+(alternative equal-cost points on the frontier).
 
 | Config | shape | attention | Params | b1 pos/s | b8 pos/s |
 |---|---|---|---|---|---|
@@ -127,7 +133,13 @@ full-density attention at 2/3 the cost; FF ratio F = 2×inner (vs 3×) another +
 | CGX-B | C384 i192 F576, 12×3 | linear, every-2, w96 | 15.16M | 52.1 | 76.3 |
 | CGX-L | C512 i256 F768, 10×3 | linear, every-3, w128 | 21.78M | 48.4 | 60.5 |
 | CGX-S softmax ref | C256 i128 F384, 12×3 | softmax, every-3, w64 | 6.96M | 92.7 | 131.8 |
+| CGX-S e4 variant | C256 i128 F384, 12×3 | linear, every-4, w64 | 6.47M | 99.9 | 165.3 |
 | CGX-S v1 ref | C256 i128 F384, 12×3 | softmax, every-3, w128 | 6.96M | 73–86* | 111–121* |
+
+**Design space closure:** every axis is now measured — attention {type, density 1–4,
+width, head-dim}, FF {ratio, width}, structure {wrapper, sub-count, blocks 6–18,
+stem}, glue {mask, fused-QKV}, precision {fp32, bf16, int8, weight-only}. The
+speed side of this architecture is exhausted; remaining variance is Elo (training).
 
 *same configuration measured 73.2 and 85.7 in different sessions on the shared box —
 run-to-run variance ~15%; all lever comparisons above were measured within single runs.
