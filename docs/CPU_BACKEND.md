@@ -79,6 +79,41 @@ Recommendations: **tf3-b10c512** for live play, **tf3-b11c768** for maximum-stre
 analysis, **tf2-b10c384** for fast analysis. The transformer nets deliver far more Elo
 per GFLOP than convnets on CPU (tf2 is stronger than b18 at half the compute).
 
+## Performance tuning (swept and settled)
+
+Measured on 8 cores across search threads 4/6/8/12/16/24, `numNNServerThreadsPerModel`
+1/2/3, and `onnxOVThreads` 1/2/4/8 (with shared and per-handle sessions):
+
+- **Optimal is simply matching core counts**: `numSearchThreads ≈ cores`,
+  `onnxOVThreads ≈ cores`, `numNNServerThreadsPerModel = 1` (the defaults).
+- More search threads than cores fill bigger batches (avgBatch 3.8 → 10 at t=24) but
+  do **not** raise evals/s — OpenVINO's kernels are already batch-efficient, and the
+  search threads' tree work shares the same cores.
+- Multiple server threads (each with its own InferRequest on one shared
+  Core/CompiledModel) shrink batches without adding throughput on a saturated CPU.
+
+## How close to the hardware limit? (honest accounting)
+
+With bf16 (the accuracy-validated precision), measured on 8 Zen 4 cores @ ~1.5 GHz:
+
+| Layer | Convnets | Transformers |
+|---|---|---|
+| Kernel throughput vs practical bf16 peak (best GEMM, 1107 GFLOP/s) | **98%** — physics | 65–83% (attention ops) |
+| Kernel throughput vs absolute instruction ceiling (1536 GFLOP/s) | 71% | 47–60% |
+| Engine vs standalone-kernel throughput | ~75% | ~60–75% |
+
+The engine gap is **not recoverable overhead**: on CPU-only machines the MCTS tree
+work and the NN kernels share the same cores (~20–25% of CPU is productive search
+work that a GPU machine gets "for free" on separate silicon). Pipelining experiments
+(shared sessions, parallel server threads, batch oversubscription) all measured flat.
+The one genuine remaining lever is custom fused-attention kernels for the transformer
+nets (potential +15–30%, bounded by the instruction ceiling) — a from-scratch kernel
+project.
+
+All handles share one `ov::Core` and one `CompiledModel` per model (single OpenVINO
+thread pool, single graph compilation per process); each NN-server thread takes its
+own `InferRequest` from it.
+
 ## Accuracy tooling
 
 - `katago testgpuerror -model X -reference-file ref.bin` — provider `ov` vs the Eigen

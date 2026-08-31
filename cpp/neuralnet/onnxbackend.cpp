@@ -28,6 +28,7 @@
 #ifdef KATAGO_OV_NATIVE
 #include <openvino/openvino.hpp>
 #include <filesystem>
+#include <mutex>
 #include <system_error>
 #endif
 #ifdef __APPLE__
@@ -179,6 +180,14 @@ struct ComputeContext {
   // Auto resolves per handle in shouldPadBatch(), since it depends on the provider and, for
   // OpenVINO, on that thread's device.
   enabled_t padBatchMode;
+#ifdef KATAGO_OV_NATIVE
+  // Shared across all server-thread handles (provider "ov"): one Core, one CompiledModel,
+  // one OpenVINO thread pool; each handle takes its own InferRequest from the compiled model.
+  std::shared_ptr<ov::Core> ovSharedCore;
+  std::shared_ptr<ov::CompiledModel> ovSharedCompiled;
+  std::mutex ovSharedMutex;
+  long long ovModelFileCounter = 0;
+#endif
 
   // Per-thread device type (index = serverThreadIdx). Filled with openvinoDeviceType
   // by default, and individual entries are replaced by onnxOpenVINODeviceTypeThread<N>.
@@ -765,49 +774,62 @@ struct ComputeHandle {
     size_t numOutputs = 0;
 #ifdef KATAGO_OV_NATIVE
     if(useOVNative) {
-      ovCore = std::make_shared<ov::Core>();
-      ov::AnyMap ovProps;
-      if(ctx->ovNumThreads > 0)
-        ovProps["INFERENCE_NUM_THREADS"] = std::to_string(ctx->ovNumThreads);
+      // All server-thread handles for a model share one ov::Core and one CompiledModel
+      // (and therefore one OpenVINO thread pool sized by onnxOVThreads). Each handle
+      // gets its own InferRequest, so with numNNServerThreadsPerModel > 1 one server
+      // thread can collect/distribute a batch while another's inference runs --
+      // removing the collect/eval pipeline bubble of a single serial session.
       {
-        // Map the shared precision setting; "undefined" lets the plugin pick
-        // (bf16 on AVX512_BF16 CPUs, which is the fast and validated default).
-        string p = Global::toLower(ctx->openvinoPrecision);
-        if(p == "fp16") p = "f16";
-        else if(p == "fp32") p = "f32";
-        else if(p == "bf16") p = "bf16";
-        else p = "undefined";
-        ovProps["INFERENCE_PRECISION_HINT"] = p;
+        std::lock_guard<std::mutex> lock(ctx->ovSharedMutex);
+        if(!ctx->ovSharedCore) {
+          ctx->ovSharedCore = std::make_shared<ov::Core>();
+          ov::AnyMap ovProps;
+          if(ctx->ovNumThreads > 0)
+            ovProps["INFERENCE_NUM_THREADS"] = std::to_string(ctx->ovNumThreads);
+          {
+            // Map the shared precision setting; "undefined" lets the plugin pick
+            // (bf16 on AVX512_BF16 CPUs, which is the fast and validated default).
+            string p = Global::toLower(ctx->openvinoPrecision);
+            if(p == "fp16") p = "f16";
+            else if(p == "fp32") p = "f32";
+            else if(p == "bf16") p = "bf16";
+            else p = "undefined";
+            ovProps["INFERENCE_PRECISION_HINT"] = p;
+          }
+          ctx->ovSharedCore->set_property("CPU", ovProps);
+          // OpenVINO's read_model only accepts file paths, so stage the graph bytes
+          // in a temp file, deleted right after loading (shared by all handles).
+          std::filesystem::path tmpModelPath = std::filesystem::temp_directory_path() /
+            ("katago_ov_model_" + std::to_string(ctx->ovModelFileCounter++) + ".onnx");
+          {
+            std::ofstream f(tmpModelPath, std::ios::binary);
+            f.write(onnxBytes.data(), (std::streamsize)onnxBytes.size());
+            if(!f.good())
+              throw StringError("ONNX backend: failed to write temp model file for OpenVINO at " + tmpModelPath.string());
+          }
+          std::shared_ptr<ov::Model> ovModel;
+          try {
+            ovModel = ctx->ovSharedCore->read_model(tmpModelPath.string());
+          }
+          catch(...) {
+            std::error_code ec;
+            std::filesystem::remove(tmpModelPath, ec);
+            throw;
+          }
+          {
+            std::error_code ec;
+            std::filesystem::remove(tmpModelPath, ec);
+          }
+          ctx->ovSharedCompiled = std::make_shared<ov::CompiledModel>(
+            ctx->ovSharedCore->compile_model(ovModel, "CPU"));
+        }
       }
-      ovCore->set_property("CPU", ovProps);
-      // OpenVINO's read_model only accepts file paths, so stage the graph bytes in a
-      // temp file (one per server thread, deleted right after loading).
-      std::filesystem::path tmpModelPath = std::filesystem::temp_directory_path() /
-        ("katago_ov_model_" + std::to_string(serverThreadIdx < 0 ? 0 : serverThreadIdx) + ".onnx");
-      {
-        std::ofstream f(tmpModelPath, std::ios::binary);
-        f.write(onnxBytes.data(), (std::streamsize)onnxBytes.size());
-        if(!f.good())
-          throw StringError("ONNX backend: failed to write temp model file for OpenVINO at " + tmpModelPath.string());
-      }
-      std::shared_ptr<ov::Model> ovModel;
-      try {
-        ovModel = ovCore->read_model(tmpModelPath.string());
-      }
-      catch(...) {
-        std::error_code ec;
-        std::filesystem::remove(tmpModelPath, ec);
-        throw;
-      }
-      {
-        std::error_code ec;
-        std::filesystem::remove(tmpModelPath, ec);
-      }
-      ovCompiled = std::make_shared<ov::CompiledModel>(ovCore->compile_model(ovModel, "CPU"));
+      ovCore = ctx->ovSharedCore;
+      ovCompiled = ctx->ovSharedCompiled;
       ovRequest = std::make_shared<ov::InferRequest>(ovCompiled->create_infer_request());
-      for(const auto& in : ovModel->inputs())
+      for(const auto& in : ovCompiled->inputs())
         inputNames.push_back(in.get_any_name());
-      for(const auto& out : ovModel->outputs())
+      for(const auto& out : ovCompiled->outputs())
         outputNames.push_back(out.get_any_name());
       for(auto& n : inputNames)
         inputNamePtrs.push_back(n.c_str());
