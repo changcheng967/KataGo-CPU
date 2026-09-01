@@ -9,7 +9,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 
-def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32, linear_attn=False, no_nbt=False, stem=3, conv_mix=0, dilate=1):
+def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32, linear_attn=False, no_nbt=False, stem=3, conv_mix=0, dilate=1, no_norm=False):
     rng = np.random.default_rng(seed)
     inits, nodes = [], []
 
@@ -26,6 +26,8 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
         nodes.append(helper.make_node(op, inputs, outputs, **kw))
 
     def rmsnorm(x, width, name):
+        if no_norm:
+            return x
         n("Mul", [x, x], [name + "sq"])
         n("ReduceMean", [name + "sq"], [name + "m"], axes=[1], keepdims=1)
         n("Add", [name + "m", k(name + "e", np.array(1e-5, dtype=np.float32))], [name + "me"])
@@ -236,8 +238,9 @@ if __name__ == "__main__":
     p.add_argument("--stem", type=int, default=3)
     p.add_argument("--conv-mix", type=int, default=0)
     p.add_argument("--dilate", type=int, default=1)
+    p.add_argument("--no-norm", action="store_true")
     p.add_argument("--out", required=True)
     a = p.parse_args()
-    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim, linear_attn=a.linear_attn, no_nbt=a.no_nbt, stem=a.stem, conv_mix=a.conv_mix, dilate=a.dilate)
+    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim, linear_attn=a.linear_attn, no_nbt=a.no_nbt, stem=a.stem, conv_mix=a.conv_mix, dilate=a.dilate, no_norm=a.no_norm)
     print(f"saved {a.out}: {npars/1e6:.2f}M params (C={a.C} inner={a.inner} F={a.F} "
           f"blocks={a.blocks}x{a.sub} heads={a.heads} attn={not a.no_attention})")

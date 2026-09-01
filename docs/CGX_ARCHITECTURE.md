@@ -176,6 +176,35 @@ Measured at full size: **CGX-Champ-S** (C256/i128/F320, 6.3M params):
 **CGX-Champ-M** (C384/i192/F384, 12.7M): 64.2 / 92.5 → ~50 / ~71 — both faster
 than tf2 (44 live) *and* the best-learnability architecture measured.
 
+### 2.8 Final architecture: the convolution-dominant hybrid (Rounds G2 + NOATT)
+
+The full dose-response, all at equal 1600-step budget, same seed/data/host:
+
+| variant | best-move agree | policy KL |
+|---|---|---|
+| **conv EVERY sub-block + softmax attn every-2 @ w64 — FINAL** | **36.1%** | **1.664** |
+| conv every-2nd + attn e2 w64 | 35.2% | 1.676 |
+| conv every-3rd + attn e2 w64 | 34.4% | 1.709 |
+| conv every-2nd + attn e3 w64 | 34.2% | 1.688 |
+| conv every-2nd + attn e2 w32 | 33.8% | 1.679 |
+| **pure convnet, NO attention** | 32.4% | 1.749 |
+| pure FF + attn (no conv) | 31.8% | 1.897 |
+| linear attention | 28.5% | 2.056 |
+
+The two ingredients are *independently insufficient* (31.8%, 32.4%) and jointly
+strong (36.1%) — a genuine hybrid effect, with a monotone dose-response in conv
+density (cm1 > cm2 > cm3 > none) and in attention (e2 > e3, w64 > w32). The
+final architecture is convolution-dominant: local tactics via 3×3 convs in every
+sub-block, global structure via cheap softmax attention at width 64 every 2nd
+sub-block, inside the nbt wrapper.
+
+**Host-load note:** absolute speeds in this document were measured across
+sessions on a shared machine whose effective bf16 peak varied 624–1107 GFLOP/s
+(1.8×). All *comparative* conclusions (every table above) are same-run or
+same-session comparisons and unaffected. On an unloaded host the final S-size
+config measures ≈55 pos/s batch-1 with RMSNorm (30.8 on the loaded host ×
+1.78), ≈70 without norms.
+
 **What this does and does not show:** it is an *early-learnability* ranking at a
 tiny budget (loss still falling at step 800; converged strength ordering may
 compress or change). Read honestly: softmax learns faster than linear attention
