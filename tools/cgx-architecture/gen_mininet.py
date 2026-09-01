@@ -173,7 +173,7 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
                 g = b * n_sub + s
                 if attention and g % attn_every == 0:
                     y = attention_sub(y, inner, f"b{b}s{s}a")
-                if conv_mix and g % conv_mix == 0 and g % attn_every != 0:
+                if conv_mix and g % conv_mix == 0:
                     y = convmix_sub(y, inner, f"b{b}s{s}c")
                 else:
                     y = ff_sub(y, inner, F, f"b{b}s{s}f")

@@ -152,15 +152,41 @@ seed, budget: 800 steps, batch 32, OneCycle lr 1e-3; 20k real training positions
 | k2-lin | linear, every-2, w64 | 26.0% | 2.221 |
 | k2-lcv2 | linear every-3 + conv-mix 2 | 21.1% | 2.385 |
 
+### 2.7 The champion (Round F: 2× budget race + clean conv-mix decider)
+
+| variant (equal 1600-step budget, same seed/data) | best-move agree | policy KL |
+|---|---|---|
+| **softmax e2 w64 + conv-mix 2 — CHAMPION** | **35.2%** | **1.676** |
+| softmax e2 w64 | 31.8% | 1.897 |
+| linear e2 w64 | 28.5% | 2.056 |
+
+Three findings: (1) **conv-mix wins on both axes** — it is *faster* (Round J) *and*
+learns better (+3.4pp over pure softmax; two earlier runs of it were void — a
+config collision made conv-mix 2 and attention-every 2 never co-fire, caught both
+times by byte-identical metrics between "different" variants); (2) the
+softmax-vs-linear gap *widens* with training (2.9pp → 3.3pp), so linear's early
+deficit does not self-correct; (3) softmax + conv-mix is strictly dominant among
+tested variants on learnability.
+
+**Final CGX specification (champion):** softmax attention every 2nd sub-block at
+width 64, 3×3 conv-mix sub-blocks every 2nd, SwiGLU FF elsewhere, nbt wrapper,
+12 blocks × 3 sub-blocks, RMSNorm+SiLU, mask-free at fixed 19×19, bf16.
+Measured at full size: **CGX-Champ-S** (C256/i128/F320, 6.3M params):
+78.1 pos/s batch-1, 142.6 batch-8 → **~61 live / ~110 analysis engine v/s**;
+**CGX-Champ-M** (C384/i192/F384, 12.7M): 64.2 / 92.5 → ~50 / ~71 — both faster
+than tf2 (44 live) *and* the best-learnability architecture measured.
+
 **What this does and does not show:** it is an *early-learnability* ranking at a
 tiny budget (loss still falling at step 800; converged strength ordering may
 compress or change). Read honestly: softmax learns faster than linear attention
 early (~10% relative), and the lcv2 point is confounded (less attention: every-3
 vs every-2 — a config collision in the first lcv run, identical model to k2-lin,
 was detected and rerun). The strategic trade for CPU play remains speed-vs-learnability:
-linear variants are ~1.7× faster (worth ~50–100 Elo in visits), which likely more
-than pays back the early-learnability gap at convergence — that bet is exactly
-what the full training run must settle. Scripts: `tools/cgx-architecture/`
+the champion resolves that trade: softmax+conv-mix needs no speed sacrifice
+(faster than any full-attention baseline) while learning best. The residual open
+question is only converged strength vs the tf-family itself, which needs full
+distillation/training compute (the 1600-step race is a learnability ranking, not
+converged Elo). Scripts: `tools/cgx-architecture/`
 (gen_mininet.py, teacher_precompute.py, train_cgx.py).
 
 **Design space closure:** every axis is now measured — attention {type, density 1–4,
