@@ -9,7 +9,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 
-def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32, linear_attn=False, no_nbt=False, stem=3):
+def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, attn_every=1, fused_qkv=False, use_mask=True, attn_width=None, head_dim=32, linear_attn=False, no_nbt=False, stem=3, conv_mix=0, dilate=1):
     rng = np.random.default_rng(seed)
     inits, nodes = [], []
 
@@ -62,9 +62,23 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
         for t, v in zip("qkv", parts):
             n("Reshape", [v, k(name + t + "r", np.array([0, nh, hd, 361], dtype=np.int64))], [name + t + "rs"])
             if t == "k":
-                qk.append(name + t + "rs")
+                kk = name + t + "rs"
+                if dilate > 1:
+                    n("Slice", [kk, k(name + "kst", np.array([0], dtype=np.int64)),
+                                k(name + "ken", np.array([361], dtype=np.int64)),
+                                k(name + "kax", np.array([3], dtype=np.int64)),
+                                k(name + "kst_p", np.array([dilate], dtype=np.int64))], [name + t + "sl"])
+                    kk = name + t + "sl"
+                qk.append(kk)
             else:
-                n("Transpose", [name + t + "rs"], [name + t + "th"], perm=[0, 1, 3, 2])
+                vv = name + t + "rs"
+                if t == "v" and dilate > 1:
+                    n("Slice", [vv, k(name + "vst", np.array([0], dtype=np.int64)),
+                                k(name + "ven", np.array([361], dtype=np.int64)),
+                                k(name + "vax", np.array([2], dtype=np.int64)),
+                                k(name + "vst_p", np.array([dilate], dtype=np.int64))], [name + t + "vs"])
+                    vv = name + t + "vs"
+                n("Transpose", [vv], [name + t + "th"], perm=[0, 1, 3, 2])
                 qk.append(name + t + "th")
         if linear_attn:
             # phi(x) = elu(x)+1 on Q and K; y = phiQ @ (phiK @ V), heads dim hd
@@ -107,6 +121,13 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
         n("Add", [x, o], [name + "res"])
         return name + "res"
 
+    def convmix_sub(x, inner_, name):
+        h = rmsnorm(x, inner_, name + "n")
+        n("Conv", [h, w(name + "cw", (inner_, inner_, 3, 3))], [name + "c"], pads=[1, 1, 1, 1])
+        hs = silu(name + "c", name + "cs")
+        n("Add", [x, hs], [name + "res"])
+        return name + "res"
+
     def ff_sub(x, inner_, F_, name):
         h = rmsnorm(x, inner_, name + "n")
         g = conv1x1(h, inner_, F_, name + "g")
@@ -135,9 +156,13 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
             wdt, ff_in = C, F
             y = x
             for s in range(n_sub):
-                if attention and (b * n_sub + s) % attn_every == 0:
+                g = b * n_sub + s
+                if attention and g % attn_every == 0:
                     y = attention_sub(y, C, f"b{b}s{s}a")
-                y = ff_sub(y, C, F, f"b{b}s{s}f")
+                if conv_mix and g % conv_mix == 0:
+                    y = convmix_sub(y, C, f"b{b}s{s}c")
+                else:
+                    y = ff_sub(y, C, F, f"b{b}s{s}f")
             n("Add", [res, y], [f"b{b}o"])
         else:
             xb = rmsnorm(x, C, f"b{b}pn")
@@ -145,9 +170,13 @@ def make_net(C, inner, F, n_blocks, n_sub, heads, attention, out_path, seed=0, a
             xb = conv1x1(xb, C, inner, f"b{b}p")
             y = xb
             for s in range(n_sub):
-                if attention and (b * n_sub + s) % attn_every == 0:
+                g = b * n_sub + s
+                if attention and g % attn_every == 0:
                     y = attention_sub(y, inner, f"b{b}s{s}a")
-                y = ff_sub(y, inner, F, f"b{b}s{s}f")
+                if conv_mix and g % conv_mix == 0 and g % attn_every != 0:
+                    y = convmix_sub(y, inner, f"b{b}s{s}c")
+                else:
+                    y = ff_sub(y, inner, F, f"b{b}s{s}f")
             y = rmsnorm(y, inner, f"b{b}qn")
             y = silu(y, f"b{b}qa")
             y = conv1x1(y, inner, C, f"b{b}q")
@@ -205,8 +234,10 @@ if __name__ == "__main__":
     p.add_argument("--linear-attn", action="store_true")
     p.add_argument("--no-nbt", action="store_true")
     p.add_argument("--stem", type=int, default=3)
+    p.add_argument("--conv-mix", type=int, default=0)
+    p.add_argument("--dilate", type=int, default=1)
     p.add_argument("--out", required=True)
     a = p.parse_args()
-    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim, linear_attn=a.linear_attn, no_nbt=a.no_nbt, stem=a.stem)
+    npars = make_net(a.C, a.inner, a.F, a.blocks, a.sub, a.heads, not a.no_attention, a.out, attn_every=a.attn_every, fused_qkv=a.fused_qkv, use_mask=not a.no_mask, attn_width=a.attn_width, head_dim=a.head_dim, linear_attn=a.linear_attn, no_nbt=a.no_nbt, stem=a.stem, conv_mix=a.conv_mix, dilate=a.dilate)
     print(f"saved {a.out}: {npars/1e6:.2f}M params (C={a.C} inner={a.inner} F={a.F} "
           f"blocks={a.blocks}x{a.sub} heads={a.heads} attn={not a.no_attention})")

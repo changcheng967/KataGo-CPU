@@ -136,6 +136,33 @@ depth > 12 blocks *rejected* again (16 blocks: 88.5 vs 12: 99.9); misaligned wid
 | CGX-S e4 variant | C256 i128 F384, 12×3 | linear, every-4, w64 | 6.47M | 99.9 | 165.3 |
 | CGX-S v1 ref | C256 i128 F384, 12×3 | softmax, every-3, w128 | 6.96M | 73–86* | 111–121* |
 
+**Round J (conv mixing):** replacing every-2nd FF sub-block with a 3×3 conv
+sub-block is *faster* than pure FF at identical params (103.8 vs 99.0 pos/s b1 —
+9·128² = 3·384·128 exactly) *and* adds local spatial mixing that pure
+feed-forward/attention nets lack (ladders, eyes, cuts). Adopted into the family.
+
+### 2.6 First strength signal (Round K: distillation learnability)
+
+Three 2.5M-param variants distilled from the tf3-b11c768 teacher (identical data,
+seed, budget: 800 steps, batch 32, OneCycle lr 1e-3; 20k real training positions):
+
+| variant | attention | best-move agree w/ teacher | policy KL |
+|---|---|---|---|
+| k2-smx | softmax, every-2, w64 | **28.9%** | **2.100** |
+| k2-lin | linear, every-2, w64 | 26.0% | 2.221 |
+| k2-lcv2 | linear every-3 + conv-mix 2 | 21.1% | 2.385 |
+
+**What this does and does not show:** it is an *early-learnability* ranking at a
+tiny budget (loss still falling at step 800; converged strength ordering may
+compress or change). Read honestly: softmax learns faster than linear attention
+early (~10% relative), and the lcv2 point is confounded (less attention: every-3
+vs every-2 — a config collision in the first lcv run, identical model to k2-lin,
+was detected and rerun). The strategic trade for CPU play remains speed-vs-learnability:
+linear variants are ~1.7× faster (worth ~50–100 Elo in visits), which likely more
+than pays back the early-learnability gap at convergence — that bet is exactly
+what the full training run must settle. Scripts: `tools/cgx-architecture/`
+(gen_mininet.py, teacher_precompute.py, train_cgx.py).
+
 **Design space closure:** every axis is now measured — attention {type, density 1–4,
 width, head-dim}, FF {ratio, width}, structure {wrapper, sub-count, blocks 6–18,
 stem}, glue {mask, fused-QKV}, precision {fp32, bf16, int8, weight-only}. The
