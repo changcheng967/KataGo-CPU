@@ -64,16 +64,24 @@ this if set (`FP32` to force exact precision).
 
 ## Measured performance (8-core Zen 4 @ ~1.5GHz, 8 search threads)
 
-Engine visits/s, `katago benchmark`, provider `ov`:
+Engine visits/s, `katago benchmark -t 8`, all four columns measured on the same
+host under the same load (2026-08-31, all backends built from this repo's tree;
+Eigen from `-DUSE_BACKEND=EIGEN -DUSE_AVX2=1`, MLAS = the stock `onnxProvider=cpu`,
+ov = `onnxProvider=ov`):
 
-| Model | Elo (katagotraining.org) | v/s (ov) | v/s (Eigen) | v/s (cpu/MLAS) | Fixed-time ΔElo vs b18+Eigen |
+| Model | Elo (katagotraining.org) | v/s (ov) | v/s (Eigen) | v/s (cpu/MLAS) | Fixed-time ΔElo vs b18+Eigen* |
 |---|---|---|---|---|---|
-| tf2-b10c384 (10.5M params) | 13712 | **48.9** | n/a | ~13 | **+134** |
-| b18c384nbt (26.3M) | 13608 | 31.9 | 30.7 | 18.9 | +7 |
-| tf3-b10c512 (28.5M) | 14170 | **21.8** | n/a | ~9 | **+512** |
-| b28c512nbt (72.8M) | 14105 | 11.7 | ~6 (est) | ~5 | +362 |
-| tf3-b11c768 (70.4M) | 14542 | 9.1 | n/a | ~4 | **+774** |
-| zhizi-b40c768nbt (232M) | 14549 | 3.8 | <2 (est) | ~1.5 | +650 |
+| tf2-b10c384 (10.5M params) | 13712 | **48.4** | 25.6 | 6.0 | **+178** |
+| b18c384nbt (26.3M) | 13608 | 30.1 | 28.9 | 2.8 | +6 |
+| tf3-b10c512 (28.5M) | 14170 | **20.4** | 11.0 | 2.6 | **+512** |
+| b28c512nbt (72.8M) | 14105 | 11.7 | 10.9 | 1.1 | +367 |
+| tf3-b11c768 (70.4M) | 14542 | 9.2 | 5.1 | 1.2 | **+769** |
+| zhizi-b40c768nbt (232M) | 14549 | 3.8 | 4.1 | 0.4 | +659 |
+
+\* net Elo plus a visits bonus of ~100 Elo per 2x visits (log2 of the best-of-three
+backend speed ratio vs b18+Eigen). The provider ranking per model: ov dominates every
+net except zhizi-b40c768nbt, where Eigen's conv-dense shape narrowly wins (4.1 vs
+3.8); MLAS is 5-10x behind everywhere and should not be used for CPU play.
 
 Recommendations: **tf3-b10c512** for live play, **tf3-b11c768** for maximum-strength
 analysis, **tf2-b10c384** for fast analysis. The transformer nets deliver far more Elo
