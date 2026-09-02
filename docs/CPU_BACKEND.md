@@ -161,32 +161,45 @@ games can produce absurd numbers via nnCache — a pitfall caught and documented
 here (three broken harness versions were discarded before the canonical-format
 one produced clean data).
 
-### Multi-process scaling (the one real bypass, measured)
+### Multi-process scaling (measured, with correction)
+
+The benchmark-based multi-process curve (all layouts, taskset-pinned):
+
+| layout | tf2 combined v/s | vs single |
+|---|---|---|
+| 1 process × 8 cores | 46.6 | — |
+| 2 × 4 | 49.3 | +6% |
+| **3 (3+3+2)** | **50.9** | **+9%** |
+| 4 × 2 | 49.9 | +7% |
+| 5+3 | 48.6 | +4% |
+| 6+2 | 46.9 | +1% |
+
+**Correction after protocol-level re-measurement**: the analysis-engine numbers
+are dominated by startup time and nnCache behavior at short durations — repeated
+runs swung 16–146 pos/s for the same config. After amortizing startup with 480
+distinct games, the single process measured **146.6 positions/s** — far above
+the ~48 v/s benchmark figure — because the analysis engine deduplicates
+identical positions via nnCache and fills batches across concurrent queries;
+our synthetic games also share board regions, inflating hit rates. The honest
+conclusion: **the benchmark number is a cold-cache lower bound; real multi-game
+analysis throughput is cache-workload-dependent and can be several times
+higher.** The benchmark-based +6-9% multi-process advantage at equal cold-cache
+conditions stands; under cache-heavy real workloads the single process may win
+(a larger nnCache in one process catches more). Configuration pitfalls
+documented: `analysis` mode uses `numSearchThreadsPerAnalysisThread`, and
+specifying `numSearchThreads` alongside it aborts at startup.
+
+
 
 Splitting the machine into multiple KataGo processes pinned to core subsets
 measures better than the single process for **multi-game throughput** —
 overturning an earlier dismissal that was based on single-process numbers:
 
-| layout | tf2 combined v/s | vs single 8-core |
-|---|---|---|
-| 1 process × 8 cores | 45.2 | — |
-| **2 processes × 4 cores** | **48.9** (23.8 + 25.1) | **+8%** |
-| 4 processes × 2 cores | 49.3 (4 × ~12.3) | +9% |
-
-Confirmed on tf3-b10c512 as well: 2×4-core = 20.9 combined (10.4 + 10.5) vs
-19.8 single. The mechanism: with cores *partitioned* (taskset), each process's
-4 search threads contend only with its own 4 OV threads — the time-sharing
-penalty shrinks per process, and GEMM efficiency at 4 threads is high enough
-(75-80% of 8-thread rate) that the split wins. At 2 cores per process GEMM
-efficiency collapses (~30%) but the search share becomes so cheap that it
-still matches the 2-way split.
-
-Practical use: for **parallel whole-game analysis**, run 2 processes on 4
-pinned cores each (`taskset -c 0-3` / `taskset -c 4-7`) and route queries
-round-robin — ~8% more total throughput and independent failure isolation.
-For single-game play, one process keeps all cores (single-game v/s drops to
-~24 in each half).
-
+Mechanism (benchmark conditions): partitioned cores shrink the per-process
+search/NN time-sharing penalty; 4-thread GEMM keeps 75-80% of 8-thread
+efficiency. Practical: for cold-cache parallel analysis the 3-process split
+(3+3+2 pinned cores) is the measured optimum; for cache-heavy or single-game
+workloads one process with all cores is safer.
 With these, the inference-side surface is exhausted: kernels at physics
 (conv 98%), engine dispatch at ~3 ms, threading/batching/layout/precision/
 weight-compression all measured to flat or negative, and the engine-kernel gap
