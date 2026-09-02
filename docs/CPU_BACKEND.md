@@ -108,6 +108,28 @@ compression for the transformer or conv nets on CPU**; plain bf16 through the ov
 provider is the accuracy-preserving choice. The IR loader itself is neutral
 infrastructure for future model formats.
 
+## Inference-side exhaustion log (post-v1 checks)
+
+Every remaining inference knob was measured at engine level after the main work:
+
+- **`onnxOVThreads` sweep (4/5/6/7/8, search threads 8)**: monotone to 8 — 16.2 /
+  20.0 / 23.0 / 26.2 / 31.4 v/s (b18); tf3-b10c512 same shape (10.8 / 15.2 / 19.8).
+  Leaving cores for the search threads always loses; OV should get them all.
+- **`nnMaxBatchSize` sweep (4/8/16/32)**: 30.9 / 30.9 / 29.7 / 30.2 — no effect at
+  these visit counts (the search never fills batches anyway, avgBatch ~3.7).
+- **Static-shape specialization** (fixed-batch model copies): 40.0 vs 43.4 v/s
+  (b1) and 53.6 vs 56.4 (b8) — *slower*; OV's dynamic-batch handling is already
+  optimal. Rejected.
+- **Compile-time `PERFORMANCE_HINT` / `cache_dir`**: this OpenVINO (2026.3)
+  rejects both property names at Core level (crash, then removed the knobs);
+  hints were also nil-to-negative in standalone measurements. Not supported.
+
+With these, the inference-side surface is exhausted: kernels at physics
+(conv 98%), engine at its MCTS-sharing optimum, threading/batching/layout/
+precision/weight-compression all measured to flat or negative. The remaining
+levers are architectural (see the repo's history / research notes) and
+training-side.
+
 ## Performance tuning (swept and settled)
 
 Measured on 8 cores across search threads 4/6/8/12/16/24, `numNNServerThreadsPerModel`

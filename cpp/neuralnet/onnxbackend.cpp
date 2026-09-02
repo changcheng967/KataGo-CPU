@@ -174,6 +174,8 @@ struct ComputeContext {
   string openvinoPrecision;   // FP16 / FP32 / ACCURACY (GPU only; the NPU is FP16-only)
   string openvinoNumStreams;  // 1-8
   int ovNumThreads;            // -1 = OpenVINO default; >0 pins INFERENCE_NUM_THREADS (provider 'ov')
+  string ovPerfHint;           // optional PERFORMANCE_HINT at compile time (throughput/latency)
+  string ovCacheDir;           // optional OpenVINO model compile cache directory
   bool transformerNHWC;         // run the trunk block stack channel-last (NHWC)
   bool skipScale8;              // skip the scale8 FP16-range workaround (see createComputeContext)
   // Pad every inference up to the max batch size so the graph only ever sees one input shape.
@@ -203,6 +205,8 @@ struct ComputeContext {
       openvinoPrecision(""),
       openvinoNumStreams(""),
       ovNumThreads(-1),
+      ovPerfHint(""),
+      ovCacheDir(""),
       transformerNHWC(true),
       skipScale8(false),
       padBatchMode(enabled_t::Auto)
@@ -246,6 +250,8 @@ ComputeContext* NeuralNet::createComputeContext(
   ctx->openvinoPrecision = cfg.contains("onnxOpenVINOPrecision") ? cfg.getString("onnxOpenVINOPrecision") : "";
   ctx->openvinoNumStreams = cfg.contains("onnxOpenVINONumStreams") ? cfg.getString("onnxOpenVINONumStreams") : "";
   ctx->ovNumThreads = cfg.contains("onnxOVThreads") ? cfg.getInt("onnxOVThreads", 1, 1024) : -1;
+  ctx->ovPerfHint = cfg.contains("onnxOVPerfHint") ? cfg.getString("onnxOVPerfHint") : "";
+  ctx->ovCacheDir = cfg.contains("onnxOVCacheDir") ? cfg.getString("onnxOVCacheDir") : "";
   ctx->padBatchMode = cfg.contains("onnxPadBatch") ? cfg.getEnabled("onnxPadBatch") : enabled_t::Auto;
 
   // useFP16 = false is an explicit request for full FP32 on every other backend. The only
@@ -796,6 +802,7 @@ struct ComputeHandle {
             else p = "undefined";
             ovProps["INFERENCE_PRECISION_HINT"] = p;
           }
+
           ctx->ovSharedCore->set_property("CPU", ovProps);
           std::shared_ptr<ov::Model> ovModel;
           if(OnnxModelBuilder::isIrFileName(loadedModel.modelFileName)) {
