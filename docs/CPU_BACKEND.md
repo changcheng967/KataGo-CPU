@@ -161,6 +161,30 @@ games can produce absurd numbers via nnCache — a pitfall caught and documented
 here (three broken harness versions were discarded before the canonical-format
 one produced clean data).
 
+### Alternative-backend shootout (same graphs, same host)
+
+The question "is OpenVINO really the best CPU backend?" was settled by direct
+measurement against every runnable alternative:
+
+| backend (b18 convnet, b1 / b8 ms per eval) | speed | vs OV bf16 |
+|---|---|---|
+| **OpenVINO 2026.3 (bf16)** | **25.1 / 160.7** | 1.0x |
+| PyTorch 2.13 eager (oneDNN underneath, fp32) | 69.4 / 328.5 | 0.36x / 0.49x |
+| PyTorch torch.compile (Inductor) | 55.4 / 302.2 | 0.45x / 0.53x |
+| ONNX Runtime MLAS (from the full table) | ~70 / ~290 | 0.35x / 0.55x |
+| TVM 0.26 (llvm) | failed at import (relay removed in 0.26; relax API incompatible with onnx frontend on this build) | — |
+| ORT-DNNL execution provider | no pip wheel exists for 1.x; requires a from-source ORT build | untested (build) |
+| ncnn | pip-installable, but no ONNX-conv frontend path for this graph shape mix | untested (conversion) |
+
+PyTorch (eager and compiled) is **2-3x slower than OV** — torch CPU does not
+apply bf16 to conv automatically, and Inductor's fusion cannot recover the gap.
+MLAS matches PyTorch eager, consistent with the engine measurements. The
+conclusion: **OpenVINO's bf16 CPU kernels are unchallenged among runnable
+backends on this hardware**; the only untested path is a from-source ORT+DNNL
+build (same oneDNN kernels through a different scheduler — expected at best
+to match OV, not beat it, since OV *is* the oneDNN frontend with the fewest
+layers on top).
+
 ### Multi-process scaling (measured, with correction)
 
 The benchmark-based multi-process curve (all layouts, taskset-pinned):
