@@ -87,6 +87,27 @@ Recommendations: **tf3-b10c512** for live play, **tf3-b11c768** for maximum-stre
 analysis, **tf2-b10c384** for fast analysis. The transformer nets deliver far more Elo
 per GFLOP than convnets on CPU (tf2 is stronger than b18 at half the compute).
 
+## OpenVINO IR models (.xml) and weight compression
+
+`onnxProvider = ov` also loads OpenVINO IR model files directly (`-model
+something.xml` with the weights in the sibling `something.bin`). Because an IR
+carries no embedded KataGo metadata, a sidecar `something_meta.txt` with the
+`katago.*` key=value block is required next to the `.xml` (multi-line values use
+`|` in place of newlines). This makes any OpenVINO-processed model deployable in
+the engine — quantized graphs, NNCF-compressed weights, runtime-transformed IRs —
+without re-exporting to ONNX.
+
+Measured on b18c384nbt: an int8 weight-compressed IR (NNCF `compress_weights`,
+int8_asym per-channel, ~26 MB weights) runs at the **same engine speed** as the
+plain bf16 model (30.9 vs 31.8 v/s; the earlier +10% from weight compression was
+a batch-1-only microbenchmark effect that vanishes at the engine's real batch
+sizes, where compute — not weight streaming — dominates) while degrading accuracy
+to w8a's known level (96.9% best-move, 0.25% mean winrate error; fails KataGo's
+strict testgpuerror gate at 11x limit). Conclusion: **do not use weight-only
+compression for the transformer or conv nets on CPU**; plain bf16 through the ov
+provider is the accuracy-preserving choice. The IR loader itself is neutral
+infrastructure for future model formats.
+
 ## Performance tuning (swept and settled)
 
 Measured on 8 cores across search threads 4/6/8/12/16/24, `numNNServerThreadsPerModel`

@@ -93,7 +93,7 @@ struct LoadedModel {
   LoadedModel(const string& fileName, const string& expectedSha256)
     : modelFileName(fileName), isExternalOnnx(false)
   {
-    if(OnnxModelBuilder::isOnnxFileName(fileName)) {
+    if(OnnxModelBuilder::isOnnxFileName(fileName) || OnnxModelBuilder::isIrFileName(fileName)) {
       isExternalOnnx = true;
       // loadModelFile has no logger; createComputeHandle logs the graph's build settings instead.
       externalOnnx = OnnxModelBuilder::load(fileName, expectedSha256, modelDesc, NULL);
@@ -797,28 +797,35 @@ struct ComputeHandle {
             ovProps["INFERENCE_PRECISION_HINT"] = p;
           }
           ctx->ovSharedCore->set_property("CPU", ovProps);
-          // OpenVINO's read_model only accepts file paths, so stage the graph bytes
-          // in a temp file, deleted right after loading (shared by all handles).
-          std::filesystem::path tmpModelPath = std::filesystem::temp_directory_path() /
-            ("katago_ov_model_" + std::to_string(ctx->ovModelFileCounter++) + ".onnx");
-          {
-            std::ofstream f(tmpModelPath, std::ios::binary);
-            f.write(onnxBytes.data(), (std::streamsize)onnxBytes.size());
-            if(!f.good())
-              throw StringError("ONNX backend: failed to write temp model file for OpenVINO at " + tmpModelPath.string());
-          }
           std::shared_ptr<ov::Model> ovModel;
-          try {
-            ovModel = ctx->ovSharedCore->read_model(tmpModelPath.string());
+          if(OnnxModelBuilder::isIrFileName(loadedModel.modelFileName)) {
+            // OpenVINO IR (.xml + .bin pair, e.g. weight-compressed): load by path so the
+            // weights stay in their stored (possibly int8) format.
+            ovModel = ctx->ovSharedCore->read_model(loadedModel.modelFileName);
           }
-          catch(...) {
-            std::error_code ec;
-            std::filesystem::remove(tmpModelPath, ec);
-            throw;
-          }
-          {
-            std::error_code ec;
-            std::filesystem::remove(tmpModelPath, ec);
+          else {
+            // OpenVINO's read_model only accepts file paths, so stage the graph bytes
+            // in a temp file, deleted right after loading (shared by all handles).
+            std::filesystem::path tmpModelPath = std::filesystem::temp_directory_path() /
+              ("katago_ov_model_" + std::to_string(ctx->ovModelFileCounter++) + ".onnx");
+            {
+              std::ofstream f(tmpModelPath, std::ios::binary);
+              f.write(onnxBytes.data(), (std::streamsize)onnxBytes.size());
+              if(!f.good())
+                throw StringError("ONNX backend: failed to write temp model file for OpenVINO at " + tmpModelPath.string());
+            }
+            try {
+              ovModel = ctx->ovSharedCore->read_model(tmpModelPath.string());
+            }
+            catch(...) {
+              std::error_code ec;
+              std::filesystem::remove(tmpModelPath, ec);
+              throw;
+            }
+            {
+              std::error_code ec;
+              std::filesystem::remove(tmpModelPath, ec);
+            }
           }
           ctx->ovSharedCompiled = std::make_shared<ov::CompiledModel>(
             ctx->ovSharedCore->compile_model(ovModel, "CPU"));

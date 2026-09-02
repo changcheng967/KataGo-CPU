@@ -1,3 +1,4 @@
+#include <fstream>
 #include "../neuralnet/onnxmodelbuilder.h"
 
 #include <cmath>
@@ -1365,6 +1366,45 @@ bool isOnnxFileName(const string& fileName) {
   return Global::isSuffix(lower, ".onnx") || Global::isSuffix(lower, ".onnx.gz");
 }
 
+bool isIrFileName(const string& fileName) {
+  string lower = Global::toLower(fileName);
+  return Global::isSuffix(lower, ".xml");
+}
+
+namespace {
+// Reads a sidecar key=value metadata file for OpenVINO IR models (<name>_meta.txt),
+// written by whatever tool produced the IR (e.g. weight compression from a .onnx).
+std::map<string, string> readIrSidecarMeta(const string& irFileName) {
+  string metaPath = irFileName.substr(0, irFileName.size() - 4) + "_meta.txt";
+  ifstream in(metaPath);
+  if(!in.is_open())
+    throw StringError(
+      "Error loading IR model " + irFileName + ": OpenVINO .xml models carry no embedded KataGo "
+      "metadata, so a sidecar file " + metaPath + " with the katago.* key=value block is required.");
+  map<string, string> meta;
+  string line;
+  while(getline(in, line)) {
+    Global::trim(line);
+    if(line.empty() || line[0] == '#')
+      continue;
+    size_t eq = line.find('=');
+    if(eq == string::npos)
+      throw StringError("Error parsing " + metaPath + ": line is not key=value: " + line);
+    string key = line.substr(0, eq);
+    string val = line.substr(eq + 1);
+    Global::trim(key);
+    Global::trim(val);
+    // Multi-line values (e.g. newline-separated node lists) are stored with '|'
+    // in place of newlines, since the sidecar is line-oriented.
+    size_t bar;
+    while((bar = val.find("|")) != string::npos)
+      val.replace(bar, 1, "\n");
+    meta[key] = val;
+  }
+  return meta;
+}
+}  // namespace
+
 namespace {
 
 // Metadata accessors. A key read through the plain getters is required: defaulting a missing one
@@ -1555,25 +1595,35 @@ LoadResult load(
 ) {
   LoadResult result;
   string sha256Buf;
-  {
-    string lower = Global::toLower(fileName);
-    if(Global::isSuffix(lower, ".gz"))
-      FileUtils::uncompressAndLoadFileIntoString(fileName, expectedSha256, result.serializedModel, &sha256Buf);
-    else
-      FileUtils::loadFileIntoString(fileName, expectedSha256, result.serializedModel, &sha256Buf);
-  }
-
-  // Parsing doubles peak memory for the length of this function: the raw bytes have to be kept too,
-  // since they are what gets handed to TensorRT or ONNX Runtime. The parsed copy is then dropped.
-  onnx::ModelProto model;
-  if(!model.ParseFromString(result.serializedModel))
-    throw StringError(
-      "Error loading ONNX model file " + fileName +
-      ": file could not be parsed as an ONNX ModelProto. Is it actually an ONNX file?");
-
   map<string, string> meta;
-  for(int i = 0; i < model.metadata_props_size(); i++)
-    meta[model.metadata_props(i).key()] = model.metadata_props(i).value();
+  onnx::ModelProto protoModel;  // empty for IR models; the graph stays in the .xml/.bin pair
+  const bool isIr = isIrFileName(fileName);
+  if(isIr) {
+    // OpenVINO IR: the graph itself stays in the .xml/.bin pair; only the KataGo
+    // metadata block is read here, from the sidecar _meta.txt next to the .xml.
+    meta = readIrSidecarMeta(fileName);
+    // serializedModel stays empty - the ov provider loads the IR by path, and no
+    // other backend can run an IR.
+  }
+  else {
+    {
+      string lower = Global::toLower(fileName);
+      if(Global::isSuffix(lower, ".gz"))
+        FileUtils::uncompressAndLoadFileIntoString(fileName, expectedSha256, result.serializedModel, &sha256Buf);
+      else
+        FileUtils::loadFileIntoString(fileName, expectedSha256, result.serializedModel, &sha256Buf);
+    }
+
+    // Parsing doubles peak memory for the length of this function: the raw bytes have to be kept too,
+    // since they are what gets handed to TensorRT or ONNX Runtime. The parsed copy is then dropped.
+    if(!protoModel.ParseFromString(result.serializedModel))
+      throw StringError(
+        "Error loading ONNX model file " + fileName +
+        ": file could not be parsed as an ONNX ModelProto. Is it actually an ONNX file?");
+
+    for(int i = 0; i < protoModel.metadata_props_size(); i++)
+      meta[protoModel.metadata_props(i).key()] = protoModel.metadata_props(i).value();
+  }
   MetaReader reader{meta, fileName};
 
   if(meta.count(META_VERSION) == 0)
@@ -1756,7 +1806,8 @@ LoadResult load(
   result.rmsNormNodeNames = splitLines(reader.getStringOr(META_FP32_NODES_RMSNORM, string()));
 
   // Now that the metadata is known to be self-consistent, check the graph agrees with it.
-  {
+  // (Skipped for IR models - the graph is not parsed here; OpenVINO checks it at read_model.)
+  if(!isIr) {
     const int nnXLen = result.buildParams.nnXLen;
     const int nnYLen = result.buildParams.nnYLen;
     vector<ExpectedTensor> expectedInputs;
@@ -1765,7 +1816,7 @@ LoadResult load(
     if(descBuf.metaEncoderVersion > 0)
       expectedInputs.push_back({INPUT_META, descBuf.numInputMetaChannels, false});
     expectedInputs.push_back({INPUT_MASK, 1, true});
-    checkGraphIO(reader, model.graph(), expectedInputs, true, nnXLen, nnYLen);
+    checkGraphIO(reader, protoModel.graph(), expectedInputs, true, nnXLen, nnYLen);
 
     vector<ExpectedTensor> expectedOutputs;
     expectedOutputs.push_back({OUTPUT_POLICY_PASS, descBuf.numPolicyChannels, false});
@@ -1773,15 +1824,15 @@ LoadResult load(
     expectedOutputs.push_back({OUTPUT_VALUE, descBuf.numValueChannels, false});
     expectedOutputs.push_back({OUTPUT_SCORE_VALUE, descBuf.numScoreValueChannels, false});
     expectedOutputs.push_back({OUTPUT_OWNERSHIP, descBuf.numOwnershipChannels, true});
-    checkGraphIO(reader, model.graph(), expectedOutputs, false, nnXLen, nnYLen);
+    checkGraphIO(reader, protoModel.graph(), expectedOutputs, false, nnXLen, nnYLen);
   }
 
   // Flag the input-declaration hazard described where build() declares its inputs: ONNX Runtime's
   // OpenVINO execution provider mis-binds every graph input declared after one that no node
   // consumes. Only that provider is affected, so the backends warn rather than refusing a graph
   // that is fine everywhere else.
-  {
-    const onnx::GraphProto& graph = model.graph();
+  if(!isIr) {
+    const onnx::GraphProto& graph = protoModel.graph();
     set<string> consumed;
     for(int i = 0; i < graph.node_size(); i++) {
       for(int j = 0; j < graph.node(i).input_size(); j++)

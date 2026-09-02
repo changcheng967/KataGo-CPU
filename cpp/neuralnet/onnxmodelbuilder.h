@@ -94,6 +94,7 @@ namespace OnnxModelBuilder {
 
   // True if fileName names a raw ONNX model file (.onnx or .onnx.gz) rather than a KataGo .bin.gz.
   bool isOnnxFileName(const std::string& fileName);
+  bool isIrFileName(const std::string& fileName);
 
   // Read a .onnx (or .onnx.gz) file, validate it, and fill descBuf with the model parameters
   // recorded in its metadata. Verifies the sha256 of the file contents against expectedSha256 if
