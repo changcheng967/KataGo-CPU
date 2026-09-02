@@ -200,6 +200,14 @@ search/NN time-sharing penalty; 4-thread GEMM keeps 75-80% of 8-thread
 efficiency. Practical: for cold-cache parallel analysis the 3-process split
 (3+3+2 pinned cores) is the measured optimum; for cache-heavy or single-game
 workloads one process with all cores is safer.
+
+**Mixed-net split (strong + fast in parallel)**: tf3-b11c768 (14542 Elo) on
+4 cores + tf2-b10c384 (13712 Elo) on 4 cores runs both simultaneously at
+2.3 + 7.4 v/s — a 4-core process running the big net pays the transformer
+GEMM-efficiency cliff twice (4 threads AND batch-4 shapes), so the strong net
+gets expensive fast. Verdict: mixed-net is workable for diverse opinion
+simultaneously, but for max strength just run tf3-b11c768 on all 8 cores
+(9.2 v/s single-process).
 With these, the inference-side surface is exhausted: kernels at physics
 (conv 98%), engine dispatch at ~3 ms, threading/batching/layout/precision/
 weight-compression all measured to flat or negative, and the engine-kernel gap
