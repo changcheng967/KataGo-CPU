@@ -181,6 +181,31 @@ untestable without artifact authentication; given stable-version flatness,
 no performance windfall is expected from them either — the CPU plugin's
 conv/bf16 kernels have been mature since well before 2026.1.
 
+### oneDNN direct-call microbenchmark (bypassing every graph runtime)
+
+The final "unknown backend" — calling oneDNN primitives directly in C++ on the
+exact b18 trunk convolution shape (192→192 3×3 @ 19×19, batch 8, bf16),
+installed via `apt install libdnnl-dev` (oneDNN 3.1):
+
+| path | ms/conv | GFLOP/s | ×36 convs (b18 trunk) |
+|---|---|---|---|
+| oneDNN direct, plain NCHW layouts | 2.217 | 864 | 79.8 ms |
+| **oneDNN direct, `format_tag::any`** (library-chosen blocked) | **1.427** | **1343** | **51.4 ms** |
+| OpenVINO whole b18 net (same host, same batch) | — | — | 141.8 ms |
+
+Two findings: (1) letting oneDNN pick its own blocked memory format is 1.55x
+faster than forcing NCHW — layout autonomy matters more than anything else;
+(2) the 36 trunk convs cost 51.4 ms through bare oneDNN vs ~142 ms for the
+whole net through OV. The remaining ~90 ms is the rest of the net (norms,
+activations, gpool, heads, ~7.9 GFLOP more) plus OV's graph layer. Since the
+b18 convs through OV were already measured at 98% of OV's own GEMM peak, the
+direct-call result shows the *absolute* oneDNN ceiling for this shape is
+1343 GFLOP/s — OV's whole-graph effective rate (including all non-conv ops)
+sits at ~66% of that. A from-scratch oneDNN backend with perfect fusion of
+norms/activations into conv post-ops could theoretically close part of this
+~90 ms gap (the earlier Tier-3 estimate of +10-30% remains the honest range;
+the gap is bounded by the non-conv work that must still run somewhere).
+
 ### Alternative-backend shootout (same graphs, same host)
 
 The question "is OpenVINO really the best CPU backend?" was settled by direct
