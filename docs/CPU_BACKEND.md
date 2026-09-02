@@ -201,6 +201,14 @@ efficiency. Practical: for cold-cache parallel analysis the 3-process split
 (3+3+2 pinned cores) is the measured optimum; for cache-heavy or single-game
 workloads one process with all cores is safer.
 
+**nnCache size**: sweeping `nnCacheSizePowerOfTwo` 20/23(default)/25 on the
+benchmark shows no effect (12.2 / default / 11.9 v/s — within noise); the
+cache is a throughput lever only for cache-hitting workloads (see the analysis
+section), where the default 2^23 is already sized generously. Configuration
+pitfall: the `benchmark` and `gtp` subcommands take `numSearchThreads`, while
+`analysis` takes `numSearchThreadsPerAnalysisThread` — specifying the wrong
+one against the wrong config aborts at startup.
+
 **Mixed-net split (strong + fast in parallel)**: tf3-b11c768 (14542 Elo) on
 4 cores + tf2-b10c384 (13712 Elo) on 4 cores runs both simultaneously at
 2.3 + 7.4 v/s — a 4-core process running the big net pays the transformer
