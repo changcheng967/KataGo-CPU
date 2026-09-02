@@ -206,6 +206,23 @@ norms/activations into conv post-ops could theoretically close part of this
 ~90 ms gap (the earlier Tier-3 estimate of +10-30% remains the honest range;
 the gap is bounded by the non-conv work that must still run somewhere).
 
+### ORT+DNNL execution provider (source build, the last untested official backend)
+
+Built ONNX Runtime 1.29.0 from source with `--use_dnnl` (links oneDNN 3.0.1,
+the version ORT pins). The build required: pip cmake>=3.28 (system cmake
+3.19 too old for ORT, but 4.4 needs `CMAKE_POLICY_VERSION_MINIMUM=3.5` for
+the old dnnl CMakeLists), `--allow_running_as_root`, and a
+`--recursive` clone (release tarball lacks submodules).
+
+**Result: the DNNL EP crashes on KataGo's b18 graph** —
+`could not create a primitive descriptor for a concat primitive`
+(oneDNN 3.0.1's concat kernel cannot handle the graph's concat shapes).
+The EP's graph partitioner routes unsupported ops to CPU, but the concat it
+*does* claim fails at primitive creation. This makes ORT+DNNL unusable for
+KataGo models without patching either ORT's partitioner or upgrading its
+pinned oneDNN — confirming that OpenVINO remains the only functional
+oneDNN-based runtime for these graphs.
+
 ### Alternative-backend shootout (same graphs, same host)
 
 The question "is OpenVINO really the best CPU backend?" was settled by direct
