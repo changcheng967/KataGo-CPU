@@ -27,6 +27,8 @@
 #include <onnxruntime_cxx_api.h>
 #ifdef KATAGO_OV_NATIVE
 #include <openvino/openvino.hpp>
+#include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
 #include <system_error>
@@ -1239,7 +1241,29 @@ void NeuralNet::getOutput(
       ov::Shape shape(sh->begin(), sh->end());
       gpuHandle->ovRequest->set_tensor(gpuHandle->inputNames[i], ov::Tensor(ov::element::f32, shape, (void*)data));
     }
-    gpuHandle->ovRequest->infer();
+    {
+      static bool ovTiming = (getenv("KATAGO_OV_TIMING") != NULL);
+      if(ovTiming) {
+        auto t0 = std::chrono::steady_clock::now();
+        gpuHandle->ovRequest->infer();
+        auto t1 = std::chrono::steady_clock::now();
+        static std::mutex m;
+        static double totInfer = 0, totWall = 0;
+        static long nBatches = 0, nRows = 0;
+        static auto tLast = t0;
+        std::lock_guard<std::mutex> lk(m);
+        totInfer += std::chrono::duration<double>(t1 - t0).count();
+        totWall += std::chrono::duration<double>(t0 - tLast).count();
+        tLast = t1;
+        nBatches += 1;
+        nRows += batchSize;
+        if(nBatches % 200 == 0)
+          fprintf(stderr, "[ov-timing] batches=%ld rows=%ld infer=%.1fms/batch between-batches=%.1fms rows/s(kern)=%.1f\n",
+                  nBatches, nRows, 1000.0*totInfer/nBatches, 1000.0*totWall/nBatches, nRows/(totInfer+totWall));
+      }
+      else
+        gpuHandle->ovRequest->infer();
+    }
     auto outPtr = [&](int idx) -> const float* {
       ov::Tensor t = gpuHandle->ovRequest->get_tensor(gpuHandle->outputNames[idx]);
       return (const float*)t.data();

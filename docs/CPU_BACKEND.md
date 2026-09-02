@@ -124,11 +124,34 @@ Every remaining inference knob was measured at engine level after the main work:
   rejects both property names at Core level (crash, then removed the knobs);
   hints were also nil-to-negative in standalone measurements. Not supported.
 
+### Engine cycle decomposition (direct instrumentation, `KATAGO_OV_TIMING=1`)
+
+An env-gated timer around the provider's `infer()` call decomposed the engine
+batch cycle directly (200-batch averages, 8 search threads):
+
+| net | infer() in-engine | between batches | standalone infer (same batch) |
+|---|---|---|---|
+| b18c384nbt | 132.1 ms @ avgBatch 3.65 | **2.5 ms** | ~72 ms @ batch 4 |
+| tf2-b10c384 | 82.0 ms @ avgBatch 3.65 | **2.7 ms** | ~54 ms @ batch 4 |
+
+Two findings: (1) dispatch/collect overhead between batches is **~3 ms —
+negligible**; the engine pipeline itself adds nothing. (2) `infer()` takes ~2x
+its standalone time inside the engine because the 8 search threads
+productively expand the MCTS tree (with the previous batch's results) on the
+same cores the 8 NN threads use — NN and search time-share the machine. This
+is not overhead to remove: the tree work must happen anyway, and deferring it
+(priority scheduling) cannot shorten the visit critical path because total
+work is conserved. This converts the "MCTS tax" from inference into direct
+measurement: **per engine cycle, roughly half the core-time goes to the NN and
+half to productive search** — the structural cost of running MCTS inference
+and MCTS search on the same silicon. A GPU machine gets the search half for
+free on separate hardware.
+
 With these, the inference-side surface is exhausted: kernels at physics
-(conv 98%), engine at its MCTS-sharing optimum, threading/batching/layout/
-precision/weight-compression all measured to flat or negative. The remaining
-levers are architectural (see the repo's history / research notes) and
-training-side.
+(conv 98%), engine dispatch at ~3 ms, threading/batching/layout/precision/
+weight-compression all measured to flat or negative, and the engine-kernel gap
+proven to be productive search time-sharing. The remaining levers are
+architectural and training-side.
 
 ## Performance tuning (swept and settled)
 
