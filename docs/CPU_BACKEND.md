@@ -147,6 +147,20 @@ half to productive search** — the structural cost of running MCTS inference
 and MCTS search on the same silicon. A GPU machine gets the search half for
 free on separate hardware.
 
+### Analysis-engine (multi-game) throughput
+
+Measured with the canonical JSON protocol (color-pair moves, distinct random
+games per query, `analysis_example.cfg`): the analysis engine's throughput on
+cache-cold distinct positions equals the `benchmark` numbers — the benchmark
+was representative of real analysis all along. Two workload effects worth
+knowing: queries along the same game line share PV exploration and nnCache
+(many-turn reviews run well above the cold rate), and concurrent queries from
+many games fill bigger NN batches, pushing toward the higher end of the
+batch-throughput curve. Synthetic benchmarks that reuse board regions across
+games can produce absurd numbers via nnCache — a pitfall caught and documented
+here (three broken harness versions were discarded before the canonical-format
+one produced clean data).
+
 With these, the inference-side surface is exhausted: kernels at physics
 (conv 98%), engine dispatch at ~3 ms, threading/batching/layout/precision/
 weight-compression all measured to flat or negative, and the engine-kernel gap
