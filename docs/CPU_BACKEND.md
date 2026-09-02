@@ -214,14 +214,20 @@ the version ORT pins). The build required: pip cmake>=3.28 (system cmake
 the old dnnl CMakeLists), `--allow_running_as_root`, and a
 `--recursive` clone (release tarball lacks submodules).
 
-**Result: the DNNL EP crashes on KataGo's b18 graph** —
-`could not create a primitive descriptor for a concat primitive`
-(oneDNN 3.0.1's concat kernel cannot handle the graph's concat shapes).
-The EP's graph partitioner routes unsupported ops to CPU, but the concat it
-*does* claim fails at primitive creation. This makes ORT+DNNL unusable for
-KataGo models without patching either ORT's partitioner or upgrading its
-pinned oneDNN — confirming that OpenVINO remains the only functional
-oneDNN-based runtime for these graphs.
+**Result: the DNNL EP cannot run ANY KataGo graph** (both convnet and
+transformer variants tested). Two independent failure modes:
+1. With DNNL handling Concat: `could not create a primitive descriptor for a
+   concat primitive` (oneDNN 3.0.1's concat kernel cannot handle the shapes).
+2. With Concat patched to fall back to CPU: `Non concat axis dimensions must
+   match: Axis 0 has mismatched dimensions of 1 and 8` at the `gpconcat` node
+   — KataGo's global-pooling architecture broadcasts batch-1 global tensors
+   alongside batch-8 spatial tensors, and the DNNL/CPU partition boundary
+   breaks the broadcast materialization.
+
+The gpconcat pattern is core to KataGo's architecture (present in every
+model since the gpool feature), so this is a fundamental incompatibility,
+not a patchable bug. **OpenVINO remains the only functional oneDNN-based
+runtime for KataGo graphs.**
 
 ### Alternative-backend shootout (same graphs, same host)
 
