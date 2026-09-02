@@ -201,6 +201,13 @@ efficiency. Practical: for cold-cache parallel analysis the 3-process split
 (3+3+2 pinned cores) is the measured optimum; for cache-heavy or single-game
 workloads one process with all cores is safer.
 
+**Search-parameter sweep** (cPuctExploration 0.8/1.2/1.6,
+fpuReductionMax 0.1/0.2/0.5): all within ±5% visits/s — the MCTS parameters
+govern strength trade-offs, not throughput; the search work per visit is
+invariant to them. (During this sweep the host load was elevated: load average
+~20 on the shared 512-thread machine — absolute numbers here are depressed
+but the within-run comparison holds.)
+
 **nnCache size**: sweeping `nnCacheSizePowerOfTwo` 20/23(default)/25 on the
 benchmark shows no effect (12.2 / default / 11.9 v/s — within noise); the
 cache is a throughput lever only for cache-hitting workloads (see the analysis
