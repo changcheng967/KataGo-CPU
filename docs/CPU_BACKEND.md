@@ -161,6 +161,26 @@ games can produce absurd numbers via nnCache — a pitfall caught and documented
 here (three broken harness versions were discarded before the canonical-format
 one produced clean data).
 
+### OpenVINO version comparison (2026.1 / 2026.2.1 / 2026.3.1)
+
+Nightly builds require GitHub artifact auth (no public pip wheel); the
+practical question — does the latest stable beat earlier ones — was measured
+in isolated venvs on the same host:
+
+| version | b18 b1 pos/s | b18 b8 pos/s (3-run mean) | tf3-b512 b8 |
+|---|---|---|---|
+| 2026.1.0 | 43.6 | 56.0 | — |
+| 2026.2.1 | 44.0 | 49.2 (48.4/49.6/49.6) | 35.2 |
+| **2026.3.1 (current)** | 43.2 | **52.1 (56.2/49.8/50.2)** | 34.9 |
+
+Differences are within host noise (±10% run-to-run on this shared machine);
+no version has a decisive kernel advantage for these graphs. The engine links
+against whatever OV ships in `OV_ROOT`, so upgrading OV underneath the same
+katago binary is safe but brings no measured gain. Nightly builds are
+untestable without artifact authentication; given stable-version flatness,
+no performance windfall is expected from them either — the CPU plugin's
+conv/bf16 kernels have been mature since well before 2026.1.
+
 ### Alternative-backend shootout (same graphs, same host)
 
 The question "is OpenVINO really the best CPU backend?" was settled by direct
