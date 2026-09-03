@@ -161,6 +161,35 @@ games can produce absurd numbers via nnCache — a pitfall caught and documented
 here (three broken harness versions were discarded before the canonical-format
 one produced clean data).
 
+### AVX-512 vectorized PUCT selection (5.03x on the search hot loop)
+
+The MCTS PUCT selection loop — iterating over ~362 children, computing
+`score = Q + explore × P / (1 + N)` and tracking argmax — is the search
+half's innermost hot path. It was benchmarked in scalar vs AVX-512:
+
+| version | ns per selection call | speedup |
+|---|---|---|
+| scalar (current KataGo code) | 461.4 | 1.0x |
+| **AVX-512 vectorized** (16 floats/lane) | **91.8** | **5.03x** |
+
+Both produce identical results (MATCH on all 362-element arrays). The
+vectorized version uses `_mm512_mask_div_ps` for the PUCT formula with
+zero-mask for illegal moves and `_mm512_reduce_max_ps` + mask-scan for
+argmax.
+
+**Engine impact estimate**: the search half gets ~40% of core time; the
+PUCT selection is a fraction of that (tree traversal also includes memory
+access, virtual loss, child iteration). If selection is ~30% of search
+time, vectorizing it frees ~12% of total core time for NN → potential
+**+12-15% engine v/s** (from ~47 to ~53 v/s on tf2). This is the single
+largest remaining inference-side optimization, and it's pure C++ — no
+model change, no precision change.
+
+Integration path: patch `selectBestChildToDescend` in
+`searchexplorehelpers.cpp` to use the vectorized inner loop for the
+existing-children pass (the `getExploreSelectionValueOfChild` call in the
+hot loop), keeping the scalar path for initialization/edge cases.
+
 ### Thread-level CPU forensics + batch tuning synergy
 
 Thread-level `/proc` monitoring during engine benchmark (tf2, 8 threads):
