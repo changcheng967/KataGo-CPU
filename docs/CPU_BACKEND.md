@@ -161,6 +161,34 @@ games can produce absurd numbers via nnCache — a pitfall caught and documented
 here (three broken harness versions were discarded before the canonical-format
 one produced clean data).
 
+### System-level: NUMA locality, SMT topology, huge pages, affinity
+
+The last untested inference-side dimension — hardware topology — was measured
+(2026-09-02, all tf2, 8 search threads):
+
+| affinity setup | visits/s | mechanism |
+|---|---|---|
+| **default (scheduler picks 8 of 512 visible)** | **46.5** | scheduler naturally picks same-socket cores |
+| pinned 0-7 (all node0, 8 physical cores) | 44.8 | pinning *hurts* vs free scheduling |
+| pinned 0-3+256-259 (4 physical + 4 HT siblings) | 24.2 | SMT siblings share FMA units → ~46% loss |
+| pinned 0-3+128-131 (4 node0 + 4 node1) | 25.8 | cross-NUMA memory latency → ~45% loss |
+
+**OpenVINO's `AFFINITY` property**: rejected by OV 2026.3 CPU plugin (property
+name unsupported, same API churn as PERF_HINT). **Huge pages**: THP is in
+`madvise` mode and the container cannot write to `/sys/kernel/mm/`; OV does
+not expose an allocation-hint knob to request huge pages. Both are upstream
+requests, not actionable here.
+
+**Findings**: (1) the Linux scheduler's default placement is already optimal —
+it naturally co-locates threads on one socket; manual pinning to 0-7 actually
+lost ~4% (likely because the scheduler also avoids busy cores). (2) SMT sibling
+sharing is catastrophic (~46% loss — the 512 "cores" are 256 physical + 256 HT,
+and 4 HT pairs = 4 effective cores for GEMM). (3) Cross-NUMA is equally bad.
+This closes the topology axis: **the default scheduling already achieves the
+optimal layout, and the cpuset cgroup mask (0-511) is the real enemy — if the
+host admin could narrow it to 8 same-socket physical cores, up to ~4% may be
+recoverable from avoiding scheduler cross-socket migration**.
+
 ### OpenVINO version comparison (2026.1 / 2026.2.1 / 2026.3.1)
 
 Nightly builds require GitHub artifact auth (no public pip wheel); the
