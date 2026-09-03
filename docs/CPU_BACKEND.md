@@ -584,3 +584,54 @@ fallback everywhere else, and `KATAGO_PUCT_VEC=0` disables it.
   which are dead at non-root nodes), reducing cross-core cache-line traffic on a
   tree all 8 threads are hammering simultaneously. Coherence effects are invisible
   to per-thread cycle counters but visible to throughput.
+
+## Custom fused-attention kernel experiment (negative result, infrastructure kept)
+
+The last theoretical lever from the pipeline accounting was a hand-written fused
+attention kernel for the transformer nets ("attention sv-subgraph at 65-83% of
+peak"). The full apparatus was built and measured; the speed claim does not hold
+for this model family on Zen 4, and the experiment is recorded here with receipts.
+
+What works (and is kept, `cpp/scripts/katflash/`):
+
+- **OV custom-op injection is fully proven.** A custom ONNX node maps to a
+  `ov::op::Op` via `frontend::onnx::OpExtension`; the CPU plugin executes it
+  through `evaluate()` — **provided the op overrides `has_evaluate()` to return
+  true** (the plugin's probe calls evaluate with empty dummies, so a plain
+  override reads as "not implemented"). `ov::parallel_for` works inside
+  evaluate on the plugin's own TBB pool. This is a reusable injection path for
+  any future custom op.
+- **Model surgery**: `fuse_attention.py` replaces each layer's 22-node attention
+  window (head splits, RoPE q/k, scores, scale, board mask, softmax, probs@V,
+  head merge) with one `KatFlashAttention` node — 440 nodes removed, 20 fused
+  ops, metadata preserved, downstream `out_proj` wiring unchanged.
+- **Kernel correctness**: single-layer A/B vs the original window: max diff
+  4.5e-3 (fp32 kernel vs OV's bf16 path — in-family). All constants derived
+  from input shapes; zero attributes.
+
+The kernel itself (AVX-512, dh==32 specialized, scalar fallback otherwise) went
+through: vector polynomial exp (v0 was 5.6x slow on scalar `std::exp`),
+four-accumulator FMA chain breaking, 16-query tiling (the per-query version was
+L2-bandwidth-bound at ~47KB of K/V traffic per query), register-blocking with
+8-accumulator chunks (acc[16] spills to stack). Head-to-head on one attention
+layer (N=2, 8 cores): **OV window 0.7-0.9 ms vs custom op 1.17 ms (0.7x)**.
+Full model (tf2, bf16 pipeline): **fused reaches 0.66-0.73x of the original
+across batch 1-8** (0.85-0.88x with everything forced f32).
+
+Why it loses, structurally: KataGo's transformer attention has dh=32 — the
+score reduction is 32-deep, so a 16-lane vector kernel amortizes its loads well
+but must run f32 FMAs at 2/cycle. OV's path runs the same matmuls in bf16
+(twice the math width via oneDNN). `vdpbf16ps` cannot express this reduction's
+layout (it sums adjacent pairs into lanes; the score reduction needs the d-axis
+summed while lanes hold distinct keys), so the 2x width is not reachable by
+restructuring. With the softmax, RoPE, and the 361-length odd shapes in the
+same kernel, a correct hand kernel lands at parity-class at best — and OV's
+subgraph already fuses scores+softmax+values. The earlier "+15-30%" estimate
+came from GEMM-efficiency numbers at larger depths and does not transfer to
+dh=32. Verdict: **OpenVINO's fused attention path is at the practical ceiling
+for this shape on this hardware; a custom kernel is a measured dead end.**
+
+Reproduce: `katflash.cpp` (full-model correctness+timing vs original, f32 and
+bf16 worlds), `test_layer.cpp` (single-layer head-to-head with per-phase cycle
+profile via `KATAGO_KATFLASH_PROF=1`), `extract_layer.py`, `make_hello_onnx.py`
++ `test_ext.cpp` (injection hello-world).
