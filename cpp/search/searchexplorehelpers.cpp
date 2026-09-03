@@ -6,6 +6,168 @@
 #include "../core/using.h"
 //------------------------
 
+#include <cstdlib>
+#include <cstring>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+//----------------------------------------------------------------------------------------
+//Vectorized PUCT child-selection kernels.
+//
+//The innermost loop of selectBestChildToDescend scores every child with
+//  score = exploreScaling * policy / (1 + childWeight) + flip * childUtility
+//and takes the argmax. On x86-64 we compute that with AVX-512 (8 doubles/call)
+//or AVX2 (4 doubles/call), selected at runtime; everything else keeps the
+//original scalar loop.
+//
+//Bit-exactness with the scalar path in Search::getExploreSelectionValue:
+// - all math is IEEE double with the same operation order (mul, then div by
+//   (1+w), then add of the negated-or-not utility);
+// - no FMA contraction: the intrinsics are explicit, and the scalar form has
+//   no multiplies feeding adds, so neither side can contract;
+// - ties prefer the lowest index, matching the scalar strict ">" compare;
+// - children with policy < 0 (illegal moves) are masked to -infinity so they
+//   can never strictly exceed the initial best, matching the scalar behavior
+//   where POLICY_ILLEGAL_SELECTION_VALUE never beats the running max.
+//----------------------------------------------------------------------------------------
+namespace {
+
+constexpr double PUCT_VEC_ILLEGAL_SCORE = -1e50; // == Search::POLICY_ILLEGAL_SELECTION_VALUE
+
+inline double puctVecScore(double exploreScaling, double policy, double childWeight, double childUtility, double flip) {
+  return exploreScaling * policy / (1.0 + childWeight) + flip * childUtility;
+}
+
+#if defined(__x86_64__)
+
+inline bool puctVecAvx512Supported() {
+  static const bool supported = __builtin_cpu_supports("avx512f");
+  return supported;
+}
+
+inline bool puctVecAvx2Supported() {
+  static const bool supported = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+  return supported;
+}
+
+__attribute__((target("avx512f")))
+int puctVecArgmaxAvx512(const float* policy, const double* weight, const double* utility, int n, double exploreScaling, double flip) {
+  const __m512d v_es = _mm512_set1_pd(exploreScaling);
+  const __m512d v_flip = _mm512_set1_pd(flip);
+  const __m512d v_one = _mm512_set1_pd(1.0);
+  const __m512d v_ninf = _mm512_set1_pd(-INFINITY);
+  const __m512d v_zero = _mm512_setzero_pd();
+  double best = PUCT_VEC_ILLEGAL_SCORE;
+  int bestIdx = -1;
+  int i = 0;
+  for(; i + 8 <= n; i += 8) {
+    __m512d p = _mm512_cvtps_pd(_mm256_loadu_ps(&policy[i]));
+    __m512d w = _mm512_loadu_pd(&weight[i]);
+    __m512d u = _mm512_loadu_pd(&utility[i]);
+    __mmask8 valid = _mm512_cmp_pd_mask(p, v_zero, _CMP_GE_OQ);
+    __m512d score = _mm512_add_pd(
+      _mm512_div_pd(_mm512_mul_pd(v_es, p), _mm512_add_pd(v_one, w)),
+      _mm512_mul_pd(v_flip, u)
+    );
+    score = _mm512_mask_mov_pd(v_ninf, valid, score);
+    double bmax = _mm512_reduce_max_pd(score);
+    if(bmax > best) {
+      __mmask8 eq = _mm512_cmp_pd_mask(score, _mm512_set1_pd(bmax), _CMP_EQ_OQ);
+      bestIdx = i + __builtin_ctz((unsigned)eq);
+      best = bmax;
+    }
+  }
+  for(; i < n; i++) {
+    double p = (double)policy[i];
+    if(p < 0)
+      continue;
+    double score = puctVecScore(exploreScaling, p, weight[i], utility[i], flip);
+    if(score > best) {
+      best = score;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+__attribute__((target("avx2,fma")))
+int puctVecArgmaxAvx2(const float* policy, const double* weight, const double* utility, int n, double exploreScaling, double flip) {
+  const __m256d v_es = _mm256_set1_pd(exploreScaling);
+  const __m256d v_flip = _mm256_set1_pd(flip);
+  const __m256d v_one = _mm256_set1_pd(1.0);
+  const __m256d v_ninf = _mm256_set1_pd(-INFINITY);
+  const __m256d v_zero = _mm256_setzero_pd();
+  double best = PUCT_VEC_ILLEGAL_SCORE;
+  int bestIdx = -1;
+  int i = 0;
+  for(; i + 4 <= n; i += 4) {
+    __m256d p = _mm256_cvtps_pd(_mm_loadu_ps(&policy[i]));
+    __m256d w = _mm256_loadu_pd(&weight[i]);
+    __m256d u = _mm256_loadu_pd(&utility[i]);
+    __m256d valid = _mm256_cmp_pd(p, v_zero, _CMP_GE_OQ);
+    __m256d score = _mm256_add_pd(
+      _mm256_div_pd(_mm256_mul_pd(v_es, p), _mm256_add_pd(v_one, w)),
+      _mm256_mul_pd(v_flip, u)
+    );
+    score = _mm256_blendv_pd(v_ninf, score, valid);
+    __m256d m1 = _mm256_max_pd(score, _mm256_permute2f128_pd(score, score, 0x01));
+    __m256d m2 = _mm256_max_pd(m1, _mm256_permute_pd(m1, 0x05));
+    double bmax = _mm256_cvtsd_f64(m2);
+    if(bmax > best) {
+      int eq = _mm256_movemask_pd(_mm256_cmp_pd(score, _mm256_set1_pd(bmax), _CMP_EQ_OQ));
+      bestIdx = i + __builtin_ctz((unsigned)eq);
+      best = bmax;
+    }
+  }
+  for(; i < n; i++) {
+    double p = (double)policy[i];
+    if(p < 0)
+      continue;
+    double score = puctVecScore(exploreScaling, p, weight[i], utility[i], flip);
+    if(score > best) {
+      best = score;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+#endif
+
+//Argmax of the PUCT selection score over n gathered children, or -1 if none is
+//a legal move. See the block comment above for the exactness contract.
+int puctVecArgmax(const float* policy, const double* weight, const double* utility, int n, double exploreScaling, double flip) {
+  if(n <= 0)
+    return -1;
+#if defined(__x86_64__)
+  if(puctVecAvx512Supported())
+    return puctVecArgmaxAvx512(policy, weight, utility, n, exploreScaling, flip);
+  if(puctVecAvx2Supported())
+    return puctVecArgmaxAvx2(policy, weight, utility, n, exploreScaling, flip);
+#endif
+  double best = PUCT_VEC_ILLEGAL_SCORE;
+  int bestIdx = -1;
+  for(int i = 0; i < n; i++) {
+    double p = (double)policy[i];
+    if(p < 0)
+      continue;
+    double score = puctVecScore(exploreScaling, p, weight[i], utility[i], flip);
+    if(score > best) {
+      best = score;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+bool puctVecEnabledByEnv() {
+  const char* s = std::getenv("KATAGO_PUCT_VEC");
+  return s == NULL || std::strcmp(s, "0") != 0;
+}
+
+}
+
 static double cpuctExploration(double totalChildWeight, const SearchParams& searchParams) {
   return searchParams.cpuctExploration +
     searchParams.cpuctExplorationLog * log((totalChildWeight + searchParams.cpuctExplorationBase) / searchParams.cpuctExplorationBase);
@@ -340,6 +502,7 @@ void Search::selectBestChildToDescend(
   double maxChildWeight = 0.0;
   double totalChildWeight = 0.0;
   int64_t totalChildEdgeVisits = 0;
+  int numChildrenPresent = 0;
   const NNOutput* nnOutput = node.getNNOutput();
   assert(nnOutput != NULL);
   const float* policyProbs = nnOutput->getPolicyProbsMaybeNoised();
@@ -348,6 +511,7 @@ void Search::selectBestChildToDescend(
     const SearchNode* child = childPointer.getIfAllocated();
     if(child == NULL)
       break;
+    numChildrenPresent++;
     Loc moveLoc = childPointer.getMoveLocRelaxed();
     int movePos = getPos(moveLoc);
     float nnPolicyProb = policyProbs[movePos];
@@ -460,39 +624,115 @@ void Search::selectBestChildToDescend(
   //Try all existing children
   //Also count how many children we actually find
   numChildrenFound = 0;
-  for(int i = 0; i<childrenCapacity; i++) {
-    const SearchChildPointer& childPointer = children[i];
-    const SearchNode* child = childPointer.getIfAllocated();
-    if(child == NULL)
-      break;
-    numChildrenFound++;
-    int64_t childEdgeVisits = childPointer.getEdgeVisits();
 
-    Loc moveLoc = childPointer.getMoveLocRelaxed();
-    bool isDuringSearch = true;
-    double selectionValue = getExploreSelectionValueOfChild(
-      node,policyProbs,child,
-      moveLoc,
-      exploreScaling,
-      totalChildWeight,childEdgeVisits,fpuValue,
-      parentUtility,parentWeightPerVisit,
-      isDuringSearch,antiMirror,maxChildWeight,
-      countEdgeVisit,
-      &thread
-    );
-    if(selectionValue > maxSelectionValue) {
-      // if(child->state.load(std::memory_order_seq_cst) == SearchNode::STATE_EVALUATING) {
-      //   selectionValue -= EVALUATING_SELECTION_VALUE_PENALTY;
-      //   if(isRoot && child->prevMoveLoc == Location::ofString("K4",thread.board)) {
-      //     out << "ouch" << "\n";
-      //   }
-      // }
-      maxSelectionValue = selectionValue;
-      bestChildIdx = i;
-      bestChildMoveLoc = moveLoc;
+  //Vectorized fast path. For any node that is not the root and has no human-SL
+  //policy and no anti-mirror adjustments, each child's selection value is the
+  //fixed PUCT expression below over three atomically-loaded stats, so we gather
+  //them and argmax with SIMD. Only worth it once the child count is large
+  //enough that the arithmetic outweighs the loads - for the young nodes (<=8
+  //children) that most descent steps hit, the gather overhead cancels the win.
+  //The root is excluded because it carries extra per-child hacks (futile-visit
+  //pruning, hintloc, wide-root noise, endgame score bonuses) with early-return
+  //values. countEdgeVisit is always true when !useHumanSL. Set KATAGO_PUCT_VEC=0
+  //to disable (A/B testing).
+  static const bool puctVecEnabled = puctVecEnabledByEnv();
+  if(puctVecEnabled && !useHumanSL && !antiMirror && &node != rootNode && numChildrenPresent >= 32) {
+    alignas(64) float vPolicy[NNPos::MAX_NN_POLICY_SIZE];
+    alignas(64) double vWeight[NNPos::MAX_NN_POLICY_SIZE];
+    alignas(64) double vUtility[NNPos::MAX_NN_POLICY_SIZE];
+    const double utilityRadius = searchParams.winLossUtilityFactor + searchParams.staticScoreUtilityFactor + searchParams.dynamicScoreUtilityFactor;
+    int n = 0;
+    for(int i = 0; i<childrenCapacity; i++) {
+      const SearchChildPointer& childPointer = children[i];
+      const SearchNode* child = childPointer.getIfAllocated();
+      if(child == NULL)
+        break;
+      numChildrenFound++;
+      int64_t childEdgeVisits = childPointer.getEdgeVisits();
+      Loc moveLoc = childPointer.getMoveLocRelaxed();
+      int movePos = getPos(moveLoc);
+      float nnPolicyProb = policyProbs[movePos];
+
+      if(nnPolicyProb >= 0) {
+        //Same loads and adjustments as Search::getExploreSelectionValueOfChild's
+        //non-root path (getEndingWhiteScoreBonus is always 0 away from the root).
+        int32_t childVirtualLosses = child->virtualLosses.load(std::memory_order_acquire);
+        int64_t childVisits = child->stats.visits.load(std::memory_order_acquire);
+        double utilityAvg = child->stats.utilityAvg.load(std::memory_order_acquire);
+        double childWeight = child->stats.getChildWeight(childEdgeVisits,childVisits);
+
+        double childUtility;
+        if(childVisits <= 0 || childWeight <= 0.0)
+          childUtility = fpuValue;
+        else
+          childUtility = utilityAvg;
+
+        if(childVirtualLosses > 0) {
+          double virtualLossWeight = childVirtualLosses * searchParams.numVirtualLossesPerThread;
+          double virtualLossUtility = (node.nextPla == P_WHITE ? -utilityRadius : utilityRadius);
+          double virtualLossWeightFrac = (double)virtualLossWeight / (virtualLossWeight + std::max(0.25,childWeight));
+          childUtility = childUtility + (virtualLossUtility - childUtility) * virtualLossWeightFrac;
+          childWeight += virtualLossWeight;
+        }
+
+        vPolicy[n] = nnPolicyProb;
+        vWeight[n] = childWeight;
+        vUtility[n] = childUtility;
+      }
+      else {
+        //Illegal moves never win the argmax; masked out by negative policy.
+        vPolicy[n] = nnPolicyProb;
+        vWeight[n] = 0.0;
+        vUtility[n] = 0.0;
+      }
+      n++;
+
+      posesWithChildBuf[movePos] = true;
     }
 
-    posesWithChildBuf[getPos(moveLoc)] = true;
+    double flip = node.nextPla == P_WHITE ? 1.0 : -1.0;
+    int vecBest = puctVecArgmax(vPolicy, vWeight, vUtility, n, exploreScaling, flip);
+    if(vecBest >= 0) {
+      bestChildIdx = vecBest;
+      bestChildMoveLoc = children[vecBest].getMoveLocRelaxed();
+      maxSelectionValue = puctVecScore(exploreScaling, vPolicy[vecBest], vWeight[vecBest], vUtility[vecBest], flip);
+    }
+  }
+  else {
+    for(int i = 0; i<childrenCapacity; i++) {
+      const SearchChildPointer& childPointer = children[i];
+      const SearchNode* child = childPointer.getIfAllocated();
+      if(child == NULL)
+        break;
+      numChildrenFound++;
+      int64_t childEdgeVisits = childPointer.getEdgeVisits();
+
+      Loc moveLoc = childPointer.getMoveLocRelaxed();
+      bool isDuringSearch = true;
+      double selectionValue = getExploreSelectionValueOfChild(
+        node,policyProbs,child,
+        moveLoc,
+        exploreScaling,
+        totalChildWeight,childEdgeVisits,fpuValue,
+        parentUtility,parentWeightPerVisit,
+        isDuringSearch,antiMirror,maxChildWeight,
+        countEdgeVisit,
+        &thread
+      );
+      if(selectionValue > maxSelectionValue) {
+        // if(child->state.load(std::memory_order_seq_cst) == SearchNode::STATE_EVALUATING) {
+        //   selectionValue -= EVALUATING_SELECTION_VALUE_PENALTY;
+        //   if(isRoot && child->prevMoveLoc == Location::ofString("K4",thread.board)) {
+        //     out << "ouch" << "\n";
+        //   }
+        // }
+        maxSelectionValue = selectionValue;
+        bestChildIdx = i;
+        bestChildMoveLoc = moveLoc;
+      }
+
+      posesWithChildBuf[getPos(moveLoc)] = true;
+    }
   }
 
   const std::vector<int>& avoidMoveUntilByLoc = thread.pla == P_BLACK ? avoidMoveUntilByLocBlack : avoidMoveUntilByLocWhite;

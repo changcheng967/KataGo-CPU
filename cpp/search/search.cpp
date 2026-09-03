@@ -6,6 +6,7 @@
 #include "../search/search.h"
 
 #include <algorithm>
+#include <atomic>
 #include <numeric>
 
 #include "../core/fancymath.h"
@@ -19,6 +20,78 @@
 #include "../search/subtreevaluebiastable.h"
 
 using namespace std;
+
+//-----------------------------------------------------------------------------------------
+//KATAGO_SEARCH_TIMING=1 instrumentation: cycle counters for the major phases of the
+//search loop, aggregated across threads and dumped to stderr at process exit. Off by
+//default; each bracketed phase costs one cached-bool check and (when on) an rdtsc pair.
+//-----------------------------------------------------------------------------------------
+namespace {
+inline bool searchTimingOn() {
+  static const bool on = std::getenv("KATAGO_SEARCH_TIMING") != NULL;
+  return on;
+}
+#if defined(__x86_64__) || defined(_M_X64)
+#include <x86intrin.h>
+inline uint64_t searchTimingClock() { return __rdtsc(); }
+#else
+inline uint64_t searchTimingClock() {
+  return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+}
+#endif
+
+std::atomic<uint64_t> g_stTotal{0};   //whole runSinglePlayout calls
+std::atomic<uint64_t> g_stSelect{0};  //selectBestChildToDescend
+std::atomic<uint64_t> g_stBackprop{0};//updateStatsAfterPlayout
+std::atomic<uint64_t> g_stGraphHash{0};//GraphHash::getGraphHash
+std::atomic<uint64_t> g_stNewNode{0}; //allocateOrFindNode + child-store mutex section
+std::atomic<uint64_t> g_stMakeMove{0};//makeBoardMoveAssumeLegal
+std::atomic<uint64_t> g_stNNFace{0};  //NN-facing: initNodeNNOutput, maybeRecompute, terminal waits
+std::atomic<uint64_t> g_stPlayouts{0};
+std::atomic<uint64_t> g_stLevels{0};
+
+struct SearchTimingReport {
+  ~SearchTimingReport() {
+    if(g_stPlayouts.load() == 0)
+      return;
+    uint64_t total = g_stTotal.load();
+    auto pct = [&](uint64_t x) { return total > 0 ? 100.0 * (double)x / (double)total : 0.0; };
+    cerr << "--------------------------------------------------" << endl;
+    cerr << "KATAGO_SEARCH_TIMING report (cycles, all search threads)" << endl;
+    cerr << "  playouts=" << g_stPlayouts.load() << " descendLevels=" << g_stLevels.load() << endl;
+    cerr << "  total(playout wall) : " << total << " (100.0%)" << endl;
+    cerr << "  select              : " << g_stSelect.load() << " (" << pct(g_stSelect.load()) << "%)" << endl;
+    cerr << "  backprop            : " << g_stBackprop.load() << " (" << pct(g_stBackprop.load()) << "%)" << endl;
+    cerr << "  graphhash           : " << g_stGraphHash.load() << " (" << pct(g_stGraphHash.load()) << "%)" << endl;
+    cerr << "  newnode+mutex       : " << g_stNewNode.load() << " (" << pct(g_stNewNode.load()) << "%)" << endl;
+    cerr << "  makemove            : " << g_stMakeMove.load() << " (" << pct(g_stMakeMove.load()) << "%)" << endl;
+    cerr << "  nnface              : " << g_stNNFace.load() << " (" << pct(g_stNNFace.load()) << "%)" << endl;
+    cerr << "  rest(descent etc.)  : "
+         << (total - g_stSelect.load() - g_stBackprop.load() - g_stGraphHash.load()
+             - g_stNewNode.load() - g_stMakeMove.load() - g_stNNFace.load())
+         << " ("
+         << pct(total - g_stSelect.load() - g_stBackprop.load() - g_stGraphHash.load()
+             - g_stNewNode.load() - g_stMakeMove.load() - g_stNNFace.load())
+         << "%)" << endl;
+    cerr << "--------------------------------------------------" << endl;
+  }
+};
+SearchTimingReport g_searchTimingReportInstance;
+
+struct SearchPhaseTimer {
+  std::atomic<uint64_t>& counter;
+  uint64_t start;
+  bool on;
+  SearchPhaseTimer(std::atomic<uint64_t>& c) : counter(c), on(searchTimingOn()) {
+    if(on)
+      start = searchTimingClock();
+  }
+  ~SearchPhaseTimer() {
+    if(on)
+      counter.fetch_add(searchTimingClock() - start, std::memory_order_relaxed);
+  }
+};
+}
 
 //-----------------------------------------------------------------------------------------
 
@@ -612,7 +685,12 @@ void Search::runWholeSearch(
         upperBoundVisitsLeft = std::min(upperBoundVisitsLeft, (double)maxPlayouts - numPlayouts);
         upperBoundVisitsLeft = std::min(upperBoundVisitsLeft, (double)maxVisits - numPlayouts - numNonPlayoutVisits);
 
-        bool finishedPlayout = runSinglePlayout(*stbuf, upperBoundVisitsLeft);
+        bool finishedPlayout;
+        {
+          SearchPhaseTimer _(g_stTotal);
+          finishedPlayout = runSinglePlayout(*stbuf, upperBoundVisitsLeft);
+        }
+        g_stPlayouts.fetch_add(1, std::memory_order_relaxed);
         if(finishedPlayout) {
           numPlayouts = numPlayoutsShared.fetch_add((int64_t)1, std::memory_order_relaxed);
           numPlayouts += 1;
@@ -1202,6 +1280,7 @@ bool Search::playoutDescend(
   SearchThread& thread, SearchNode& node,
   bool isRoot
 ) {
+  g_stLevels.fetch_add(1, std::memory_order_relaxed);
   //Hit terminal node, finish
   //forceNonTerminal marks special nodes where we cannot end the game, and is set IF they would normally be finished.
   //This includes the root if the root would be game-ended, since if we are searching a position
@@ -1212,7 +1291,10 @@ bool Search::playoutDescend(
   if(thread.history.isGameFinished && !node.forceNonTerminal) {
     //Avoid running "too fast", by making sure that a leaf evaluation takes roughly the same time as a genuine nn eval
     //This stops a thread from building a silly number of visits to distort MCTS statistics while other threads are stuck on the GPU.
-    nnEvaluator->waitForNextNNEvalIfAny();
+    {
+      SearchPhaseTimer _(g_stNNFace);
+      nnEvaluator->waitForNextNNEvalIfAny();
+    }
     if(thread.history.isNoResult) {
       double winLossValue = 0.0;
       double noResultValue = 1.0;
@@ -1239,7 +1321,11 @@ bool Search::playoutDescend(
   if(nodeState == SearchNode::STATE_UNEVALUATED) {
     //Always attempt to set a new nnOutput. That way, if some GPU is slow and malfunctioning, we don't get blocked by it.
     {
-      bool suc = initNodeNNOutput(thread,node,isRoot,false,false);
+      bool suc;
+      {
+        SearchPhaseTimer _(g_stNNFace);
+        suc = initNodeNNOutput(thread,node,isRoot,false,false);
+      }
       //Leave the node as unevaluated - only the thread that first actually set the nnOutput into the node
       //gets to update the state, to avoid races where we update the state while the node stats aren't updated yet.
       if(!suc) {
@@ -1269,7 +1355,10 @@ bool Search::playoutDescend(
   }
 
   assert(nodeState >= SearchNode::STATE_EXPANDED0);
-  maybeRecomputeExistingNNOutput(thread,node,isRoot);
+  {
+    SearchPhaseTimer _(g_stNNFace);
+    maybeRecomputeExistingNNOutput(thread,node,isRoot);
+  }
 
   //Find the best child to descend down
   int numChildrenFound;
@@ -1279,7 +1368,10 @@ bool Search::playoutDescend(
 
   SearchNode* child = NULL;
   while(true) {
-    selectBestChildToDescend(thread,node,nodeState,numChildrenFound,bestChildIdx,bestChildMoveLoc,countEdgeVisit,isRoot);
+    {
+      SearchPhaseTimer _(g_stSelect);
+      selectBestChildToDescend(thread,node,nodeState,numChildrenFound,bestChildIdx,bestChildMoveLoc,countEdgeVisit,isRoot);
+    }
 
     //The absurdly rare case that the move chosen is not legal
     //(this should only happen either on a bug or where the nnHash doesn't have full legality information or when there's an actual hash collision).
@@ -1360,12 +1452,17 @@ bool Search::playoutDescend(
         thread.history.shouldSuppressEndGameFromFriendlyPass(thread.board, thread.pla);
 
       //Make the move! We need to make the move before we create the node so we can see the new state and get the right graphHash.
-      thread.history.makeBoardMoveAssumeLegal(thread.board,bestChildMoveLoc,thread.pla,rootKoHashTable);
+      {
+        SearchPhaseTimer _(g_stMakeMove);
+        thread.history.makeBoardMoveAssumeLegal(thread.board,bestChildMoveLoc,thread.pla,rootKoHashTable);
+      }
       thread.pla = getOpp(thread.pla);
-      if(searchParams.useGraphSearch)
+      if(searchParams.useGraphSearch) {
+        SearchPhaseTimer _(g_stGraphHash);
         thread.graphHash = GraphHash::getGraphHash(
           thread.graphHash, thread.history, thread.pla, searchParams.graphSearchRepBound, searchParams.drawEquivalentWinsForWhite
         );
+      }
 
       //If conservative pass, passing from the root is always non-terminal
       //If friendly passing rules, we might also be non-terminal
@@ -1373,27 +1470,30 @@ bool Search::playoutDescend(
         (searchParams.conservativePass && (&node == rootNode)) ||
         canForceNonTerminalDueToFriendlyPass
       );
-      child = allocateOrFindNode(thread, thread.pla, bestChildMoveLoc, forceNonTerminal, thread.graphHash);
-      child->virtualLosses.fetch_add(1,std::memory_order_release);
-
       {
-        //Lock mutex to store child and move loc in a synchronized way
-        std::lock_guard<std::mutex> lock(mutexPool->getMutex(node.mutexIdx));
-        SearchNode* existingChild = children[bestChildIdx].getIfAllocated();
-        if(existingChild == NULL) {
-          //Set relaxed *first*, then release this value via storing the child. Anyone who load-acquires the child
-          //is guaranteed by release semantics to see the move as well.
-          SearchChildPointer& childPointer = children[bestChildIdx];
-          childPointer.setMoveLocRelaxed(bestChildMoveLoc);
-          childPointer.store(child);
-        }
-        else {
-          //Someone got there ahead of us. We already made a move so we can't just loop again. Instead just fail this playout and try again.
-          //Even if the node was newly allocated, no need to delete the node, it will get cleaned up next time we mark and sweep the node table later.
-          //Clean up virtual losses in case the node is a transposition and is being used.
-          child->virtualLosses.fetch_add(-1,std::memory_order_release);
-          thread.shouldCountPlayout = false;
-          return false;
+        SearchPhaseTimer _(g_stNewNode);
+        child = allocateOrFindNode(thread, thread.pla, bestChildMoveLoc, forceNonTerminal, thread.graphHash);
+        child->virtualLosses.fetch_add(1,std::memory_order_release);
+
+        {
+          //Lock mutex to store child and move loc in a synchronized way
+          std::lock_guard<std::mutex> lock(mutexPool->getMutex(node.mutexIdx));
+          SearchNode* existingChild = children[bestChildIdx].getIfAllocated();
+          if(existingChild == NULL) {
+            //Set relaxed *first*, then release this value via storing the child. Anyone who load-acquires the child
+            //is guaranteed by release semantics to see the move as well.
+            SearchChildPointer& childPointer = children[bestChildIdx];
+            childPointer.setMoveLocRelaxed(bestChildMoveLoc);
+            childPointer.store(child);
+          }
+          else {
+            //Someone got there ahead of us. We already made a move so we can't just loop again. Instead just fail this playout and try again.
+            //Even if the node was newly allocated, no need to delete the node, it will get cleaned up next time we mark and sweep the node table later.
+            //Clean up virtual losses in case the node is a transposition and is being used.
+            child->virtualLosses.fetch_add(-1,std::memory_order_release);
+            thread.shouldCountPlayout = false;
+            return false;
+          }
         }
       }
 
@@ -1401,7 +1501,10 @@ bool Search::playoutDescend(
       //Instead just add edge visits and treat that as a visit.
       //If we're not counting edge visits, then we're deliberately trying to add child visits beyond edge visits, don't return early
       if(countEdgeVisit && maybeCatchUpEdgeVisits(thread, node, child, nodeState, bestChildIdx)) {
-        updateStatsAfterPlayout(node,thread,isRoot);
+        {
+          SearchPhaseTimer _(g_stBackprop);
+          updateStatsAfterPlayout(node,thread,isRoot);
+        }
         child->virtualLosses.fetch_add(-1,std::memory_order_release);
         return true;
       }
@@ -1418,18 +1521,26 @@ bool Search::playoutDescend(
       //Instead just add edge visits and treat that as a visit.
       //If we're not counting edge visits, then we're deliberately trying to add child visits beyond edge visits, don't return early
       if(countEdgeVisit && maybeCatchUpEdgeVisits(thread, node, child, nodeState, bestChildIdx)) {
-        updateStatsAfterPlayout(node,thread,isRoot);
+        {
+          SearchPhaseTimer _(g_stBackprop);
+          updateStatsAfterPlayout(node,thread,isRoot);
+        }
         child->virtualLosses.fetch_add(-1,std::memory_order_release);
         return true;
       }
 
       //Make the move!
-      thread.history.makeBoardMoveAssumeLegal(thread.board,bestChildMoveLoc,thread.pla,rootKoHashTable);
+      {
+        SearchPhaseTimer _(g_stMakeMove);
+        thread.history.makeBoardMoveAssumeLegal(thread.board,bestChildMoveLoc,thread.pla,rootKoHashTable);
+      }
       thread.pla = getOpp(thread.pla);
-      if(searchParams.useGraphSearch)
+      if(searchParams.useGraphSearch) {
+        SearchPhaseTimer _(g_stGraphHash);
         thread.graphHash = GraphHash::getGraphHash(
           thread.graphHash, thread.history, thread.pla, searchParams.graphSearchRepBound, searchParams.drawEquivalentWinsForWhite
         );
+      }
     }
 
     break;
@@ -1446,6 +1557,7 @@ bool Search::playoutDescend(
       if(countEdgeVisit) {
         SearchNodeChildrenReference children = node.getChildren(nodeState);
         children[bestChildIdx].addEdgeVisits(1);
+        SearchPhaseTimer _(g_stBackprop);
         updateStatsAfterPlayout(node,thread,isRoot);
       }
       // Regardless of whether we count an edge visit or not here, we
@@ -1467,6 +1579,7 @@ bool Search::playoutDescend(
     nodeState = node.state.load(std::memory_order_acquire);
     SearchNodeChildrenReference children = node.getChildren(nodeState);
     children[bestChildIdx].addEdgeVisits(1);
+    SearchPhaseTimer _(g_stBackprop);
     updateStatsAfterPlayout(node,thread,isRoot);
   }
   child->virtualLosses.fetch_add(-1,std::memory_order_release);

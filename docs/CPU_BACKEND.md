@@ -429,12 +429,16 @@ With bf16 (the accuracy-validated precision), measured on 8 Zen 4 cores @ ~1.5 G
 | Engine vs standalone-kernel throughput | ~75% | ~60–75% |
 
 The engine gap is **not recoverable overhead**: on CPU-only machines the MCTS tree
-work and the NN kernels share the same cores (~20–25% of CPU is productive search
-work that a GPU machine gets "for free" on separate silicon). Pipelining experiments
-(shared sessions, parallel server threads, batch oversubscription) all measured flat.
-The one genuine remaining lever is custom fused-attention kernels for the transformer
-nets (potential +15–30%, bounded by the instruction ceiling) — a from-scratch kernel
-project.
+work and the NN kernels share the same cores. Direct instrumentation
+(`KATAGO_SEARCH_TIMING`, below) shows what that sharing actually looks like: the
+search threads are **blocked waiting for the NN 99.9% of their wall time** — all
+search-side compute combined (selection, backprop, graph hashing, move making,
+node allocation) is **~0.1%**. There is no search-side cycle budget worth chasing;
+the engine's speed is entirely a function of the NN batch pipeline. Pipelining
+experiments (shared sessions, parallel server threads, batch oversubscription) all
+measured flat. The one genuine remaining lever is custom fused-attention kernels
+for the transformer nets (potential +15–30%, bounded by the instruction ceiling) —
+a from-scratch kernel project.
 
 ## Transformer kernel profiling (why there is little left to fuse)
 
@@ -507,3 +511,53 @@ Speed: `katago benchmark -t 8 -v <visits> -n <positions>`, medians over multiple
 FLOP counts: exact per-layer MAC counts from the dumped ONNX graph. Accuracy:
 held-out real positions harvested via the input dumper; metrics are true best-move
 agreement over all 362 moves, top-5 retention, policy KL, winrate/scoreMean error.
+
+## Search-phase instrumentation (`KATAGO_SEARCH_TIMING=1`)
+
+Cycle counters around every major phase of the playout loop, aggregated across all
+search threads, dumped to stderr at process exit. Zero cost when the variable is
+unset. Phases: total playout wall, `selectBestChildToDescend`, backprop
+(`updateStatsAfterPlayout`), graph hashing, node allocation + child-store mutex,
+board move making, and everything NN-facing from the search thread's perspective
+(`initNodeNNOutput`, `maybeRecomputeExistingNNOutput`, terminal-node NN waits).
+
+tf2-b10c384, 19x19, 400 visits, 8 search threads (4473 playouts, 29708 descend
+levels):
+
+| phase | share of search-thread wall |
+|---|---|
+| NN-facing (waiting for inference) | **99.90%** |
+| select (PUCT child selection) | 0.026% |
+| make move | 0.028% |
+| backprop | 0.013% |
+| new node + mutex | 0.013% |
+| rest of descent | 0.012% |
+| graph hash | 0.006% |
+
+Implication: search-side compute is exhausted by measurement, not by argument.
+Every remaining speed lever lives in the NN batch pipeline.
+
+## Vectorized PUCT child selection (AVX-512/AVX2, x86-64)
+
+`selectBestChildToDescend`'s innermost loop scores every child with
+`exploreScaling * policy / (1 + weight) + flip * utility` and takes the argmax.
+For non-root nodes without human-SL/anti-mirror adjustments this expression is
+fixed, so the children's stats are gathered into SoA buffers and the score+argmax
+runs as AVX-512 (8 doubles) or AVX2 (4 doubles), runtime-dispatched; scalar
+fallback everywhere else, and `KATAGO_PUCT_VEC=0` disables it.
+
+- **Bit-exactness**: all math is IEEE double in the same op order as the scalar
+  path (mul → div → add, no FMA contraction), illegal children masked to -inf,
+  ties resolved to the lowest index — a single-threaded A/A run (6 positions x
+  400 visits) produces **bit-identical analysis JSON** with the path on and off.
+- **Microbenchmark** (`scripts/puct_bench.cpp`, 362 children, hot cache):
+  461.4 ns → 91.8 ns per selection call (**5.03x**) on the arithmetic alone.
+- **Engine A/B** (interleaved, counter-balanced across run order, tf2, 8 threads,
+  gated to nodes with >= 32 children): +0.8% @ 80 visits, +2.1% @ 200, +3.0% @
+  400; 16/20 paired runs won. The ungated version is ~1% slower at low visits —
+  young nodes (<= 8 children) lose more to gather overhead than they gain.
+- Why the engine gain exceeds the (tiny) cycle share of selection: the vector
+  path also **skips two atomic loads per child** (`scoreMeanAvg`/`scoreMeanSqAvg`,
+  which are dead at non-root nodes), reducing cross-core cache-line traffic on a
+  tree all 8 threads are hammering simultaneously. Coherence effects are invisible
+  to per-thread cycle counters but visible to throughput.
