@@ -833,6 +833,25 @@ void NNEvaluator::serve(
 
   vector<NNOutput*> outputBuf;
 
+  //Batch guard for CPU serving: after the first row(s) arrive, wait briefly for
+  //concurrent evals to join the same batch instead of trickling through behind it.
+  //waitPopUpToN returns as soon as anything is queued, so with one server thread the
+  //first search thread to hit a leaf would run as a batch of 1-2 while the rest queue
+  //for the next batch; on CPU, where inference is slow and batch size strongly affects
+  //GEMM efficiency and per-batch dispatch cost, coalescing pays for the sub-millisecond
+  //latency. Guard exits early when arrivals go quiet, so it adds nothing when the queue
+  //is genuinely drained. KATAGO_BATCH_GUARD_US caps the total wait in microseconds
+  //(0 = disabled, the upstream behavior); KATAGO_BATCH_QUIET_US sets the
+  //no-new-arrivals window that ends the guard early (default 150).
+  static const int64_t batchGuardUs = []() {
+    const char* s = std::getenv("KATAGO_BATCH_GUARD_US");
+    return s != NULL ? Global::stringToInt64(s) : (int64_t)0;
+  }();
+  static const int64_t batchQuietUs = []() {
+    const char* s = std::getenv("KATAGO_BATCH_QUIET_US");
+    return s != NULL ? Global::stringToInt64(s) : (int64_t)150;
+  }();
+
   unique_lock<std::mutex> lock(bufferMutex,std::defer_lock);
   while(true) {
     resultBufs.clear();
@@ -844,6 +863,27 @@ void NNEvaluator::serve(
 
     int numRows = (int)resultBufs.size();
     testAssert(numRows > 0);
+
+    if(batchGuardUs > 0 && numRows < desiredBatchSize) {
+      const int64_t stepUs = 50;
+      const int maxQuietRounds = (int)std::max<int64_t>(1, (batchQuietUs + stepUs - 1) / stepUs);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(batchGuardUs);
+      int quietRounds = 0;
+      while((int)resultBufs.size() < desiredBatchSize) {
+        std::this_thread::sleep_for(std::chrono::microseconds(stepUs));
+        int sizeBefore = (int)resultBufs.size();
+        NNResultBuf* extra;
+        while((int)resultBufs.size() < desiredBatchSize && queryQueue.tryPop(extra))
+          resultBufs.push_back(extra);
+        if((int)resultBufs.size() > sizeBefore)
+          quietRounds = 0;
+        else if(++quietRounds >= maxQuietRounds)
+          break;
+        if(std::chrono::steady_clock::now() >= deadline)
+          break;
+      }
+      numRows = (int)resultBufs.size();
+    }
 
     bool doRandomize = currentDoRandomize.load(std::memory_order_acquire);
     int defaultSymmetry = currentDefaultSymmetry.load(std::memory_order_acquire);

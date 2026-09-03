@@ -440,6 +440,29 @@ measured flat. The one genuine remaining lever is custom fused-attention kernels
 for the transformer nets (potential +15–30%, bounded by the instruction ceiling) —
 a from-scratch kernel project.
 
+## NN batch pipeline: extracted, with receipts (batch-guard experiment)
+
+The `KATAGO_SEARCH_TIMING` result above says search threads wait on the NN 99.9%
+of their wall time, so the pipeline itself was attacked directly. Findings, all
+same-host same-run comparisons (tf2-b10c384, 8 threads, 200–400 visits):
+
+| experiment | result |
+|---|---|
+| Batch composition | avgBatchSize ≈ 3.85 of a possible 8, **structurally stable** — arrivals are sparse (each search thread has one outstanding eval; re-enqueue delay = descent + input-plane build + cache-hit visits varies 0.1–10 ms) |
+| `KATAGO_BATCH_GUARD_US` coalescing (0/250/500/1000/2000 µs, rotating interleave) | avgBatchSize moves +0.07 at most; visits/s +1.6% @250 µs (within noise), −2 to −4% @≥500 µs. The queue is empty when the server idles and full when it pops, so there is nothing to coalesce. |
+| Batch caps (`nnMaxBatchSize` 3/4 vs default) | ±2% (tuner) — transformer latency scales ~linearly with batch, so coalescing is inherently low-value on OV CPU |
+| NN server duty cycle (`KATAGO_OV_TIMING`) | **~98.7% busy inferring**, ~1.3% between batches (postproc + delivery + queue) |
+| Engine vs standalone kernel throughput (alternated runs, matched batch ≈ 4) | engine reaches **63–73%** of standalone `ov_sweep.py` pos/s — ratio stable when host load halves/doubles, i.e. real, not noise. The gap is batch composition (mixed 1–8 vs fixed 4) and thread-migration jitter, not idle time. |
+| evals per visit | 0.86–0.88 — caches/terminals already absorb ~13% of NN load |
+
+Conclusion: **the pipeline is extracted.** The 99.9% wait is inference compute on
+shared cores; scheduling, coalescing, batching, and threading all measurably
+bottom out. Throughput = kernel speed × ~⅔–¾ × (1 / 0.87 evals-per-visit). The
+batch guard is kept as an env-gated experimental knob (default off) — on this
+workload it is a measured null, but arrival-dense workloads (many-thread analysis
+servers) may differ. The only remaining levers: custom transformer attention
+kernels, or models that need fewer FLOPs per eval (the CGX track).
+
 ## Transformer kernel profiling (why there is little left to fuse)
 
 Per-op profiling (`PERF_COUNT`, OpenVINO) of tf3-b11c768, batch 1 / batch 8:
