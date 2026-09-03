@@ -214,20 +214,29 @@ the version ORT pins). The build required: pip cmake>=3.28 (system cmake
 the old dnnl CMakeLists), `--allow_running_as_root`, and a
 `--recursive` clone (release tarball lacks submodules).
 
-**Result: the DNNL EP cannot run ANY KataGo graph** (both convnet and
-transformer variants tested). Two independent failure modes:
-1. With DNNL handling Concat: `could not create a primitive descriptor for a
-   concat primitive` (oneDNN 3.0.1's concat kernel cannot handle the shapes).
-2. With Concat patched to fall back to CPU: `Non concat axis dimensions must
-   match: Axis 0 has mismatched dimensions of 1 and 8` at the `gpconcat` node
-   — KataGo's global-pooling architecture broadcasts batch-1 global tensors
-   alongside batch-8 spatial tensors, and the DNNL/CPU partition boundary
-   breaks the broadcast materialization.
+**Result after full compatibility patch: ORT+DNNL runs but is 5x slower.**
 
-The gpconcat pattern is core to KataGo's architecture (present in every
-model since the gpool feature), so this is a fundamental incompatibility,
-not a patchable bug. **OpenVINO remains the only functional oneDNN-based
-runtime for KataGo graphs.**
+Three patch rounds made it load-compatible:
+1. Removing Concat from DNNL ops → still crashed (broadcast shape mismatch
+   at gpconcat: batch-1 vs batch-8 on the DNNL/CPU boundary).
+2. Removing ReduceMean/ReduceMax too (the ops feeding gpconcat) → **b18
+   runs** at **706 ms/eval = 11.3 pos/s** (OV bf16: 142 ms = 56 pos/s).
+3. The transformer (tf3-b512) hung indefinitely even with the patch —
+   likely a deadlock at a DNNL/CPU partition boundary.
+
+The 5x slowdown mechanism: every DNNL↔CPU boundary crossing copies the
+full tensor between two different memory-layout systems (oneDNN blocked
+vs ORT flat), and KataGo's graph forces dozens of such crossings per
+eval (each gpool block, each head, each non-linear op between convs).
+The more ops moved to DNNL, the fewer the crossings — but removing the
+ops that cause crashes (Concat, Reduce*) forces MORE crossings, not fewer.
+This is a structural deadlock for the DNNL EP on KataGo's architecture:
+**enough ops on DNNL to avoid copy overhead = the ops that crash.**
+
+Verdict: **ORT+DNNL is compatible only at useless speed. OpenVINO remains
+the only performant oneDNN-based runtime for KataGo graphs** — its whole-
+graph compilation avoids every boundary-crossing cost that fragments the
+ORT+DNNL approach.
 
 ### Alternative-backend shootout (same graphs, same host)
 
