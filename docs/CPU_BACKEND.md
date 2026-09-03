@@ -161,6 +161,24 @@ games can produce absurd numbers via nnCache — a pitfall caught and documented
 here (three broken harness versions were discarded before the canonical-format
 one produced clean data).
 
+### Thread-level CPU forensics + batch tuning synergy
+
+Thread-level `/proc` monitoring during engine benchmark (tf2, 8 threads):
+
+- **7.0 of 8 cores busy** (87.5% utilization; 1 core idle from scheduling gaps)
+- Kernel rate through `infer()`: **40.2 rows/s** (vs 55 standalone at same batch) = 83.5% per-core efficiency
+- The "MCTS tax" decomposes precisely: **1 idle core (12.5%) + 16.5% per-core efficiency loss** from search/NN cache contention
+
+**`nnMaxBatchSize = 4` (the engine's own recommendation, never tested on tf2)**:
+- tf2: **47.1 vs 45.7 v/s (+3%)** — smaller batches finish faster, search threads wait less
+- tf3-b512: 19.7 vs 19.5 (+1%, noise)
+- b18: 29.9 vs 31.2 (-4%, *hurts* b18 — larger net benefits from batching more)
+
+**Combined optimum (3-process split + per-process batch tuning)**:
+- 3 processes (3+3+2 cores) with `nnMaxBatchSize=2/2/1`: **50.9 v/s** — matches the
+  3-process peak (50.9) exactly; the +3% batch gain is absorbed by the multi-process
+  overhead. No compounding between the two optimizations.
+
 ### System-level: NUMA locality, SMT topology, huge pages, affinity
 
 The last untested inference-side dimension — hardware topology — was measured
