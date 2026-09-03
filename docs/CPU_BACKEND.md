@@ -635,3 +635,54 @@ Reproduce: `katflash.cpp` (full-model correctness+timing vs original, f32 and
 bf16 worlds), `test_layer.cpp` (single-layer head-to-head with per-phase cycle
 profile via `KATAGO_KATFLASH_PROF=1`), `extract_layer.py`, `make_hello_onnx.py`
 + `test_ext.cpp` (injection hello-world).
+
+## Shared-evaluator multi-game analysis: +21% over the 3-process split (v2 recipe)
+
+A config-level lever the earlier sweeps missed: for THROUGHPUT workloads over many
+independent games/positions (analysis server style), run ONE process with
+`numAnalysisThreads >= 2` instead of multiple pinned processes. All games' search
+threads feed a single shared NNEvaluator, which raises queue utilization so batches
+form fuller and the NN server idles less.
+
+Measured (tf2, 160 visits, 96 games, clean response filter, fresh-boot host,
+3 interleaved reps):
+
+| configuration | throughput |
+|---|---|
+| 3 processes × 3 search threads, pinned 3+3+2 (old recipe) | 0.24 pos/s (38 v/s aggregate) |
+| 1 process, `numAnalysisThreads=2 × 4 search threads` | **0.29 pos/s (46 v/s)** |
+| 1 process, 3 × 3 | **0.29 pos/s** |
+| 1 process, 4 × 2 | **0.29 pos/s** |
+| 1 process, 6 × 2 | **0.29 pos/s** |
+| 1 process, 8 × 1 | 0.28 pos/s |
+| 1 process, 1 game × 8 threads (sequential queries) | 0.26 pos/s |
+
+**+21% over the multi-process split**, flat across 2-6 concurrent games (batching
+saturates quickly), and one process is simpler to operate than pinned splits.
+Trade-off: per-game latency rises (each concurrent game runs at aggregate/N);
+for single-game latency (one GTP game as fast as possible) the single-process
+8-search-thread setup stays the recommendation.
+
+Measurement fix shipped with this: the earlier analysis-throughput scripts
+counted KataGo's `warnUnusedFields` warning responses as results (the queries
+carried an `initialStone` field), inflating absolute rates; both sides of every
+old comparison were equally affected, so relative conclusions stand.
+
+## Engine-vs-standalone per-row gap: attributed
+
+Engine inference reaches ~60-63% of standalone `ov_sweep.py` pos/s at matched
+batch (fresh-boot quiet host: engine 45-47 nnEvals/s vs standalone 74-76 pos/s
+at batch 4 — the gap is load-independent). Reproducing the engine's exact OV
+call pattern standalone (`engine_pattern.cpp`):
+
+| pattern | pos/s | vs clean |
+|---|---|---|
+| fixed batch 4, reused tensors | 76.1 | 1.00 |
+| fixed batch 4, fresh zero-copy wrapped buffers per call | 72.5 | -5% |
+| variable batch 1-8, reused tensors | 73.2 | -4% |
+| variable batch + fresh buffers (full engine mimic) | 69.0 | **-9%** |
+
+The zero-copy input wrapping and variable batches cost ~9% total; the remaining
+engine deficit (69 -> 46 equivalent) is tree-memory cache interference plus the
+engine's real batch-size distribution skewing smaller than the test mix — not
+addressable at the API layer.
