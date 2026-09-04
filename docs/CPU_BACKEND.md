@@ -686,3 +686,22 @@ The zero-copy input wrapping and variable batches cost ~9% total; the remaining
 engine deficit (69 -> 46 equivalent) is tree-memory cache interference plus the
 engine's real batch-size distribution skewing smaller than the test mix — not
 addressable at the API layer.
+
+## Deployment-topology closure (post-v2-recipe checks)
+
+Three follow-up cracks around the shared-evaluator recipe, measured and closed:
+
+- **Mechanism confirmed**: shared mode raises avgBatchSize 3.85 -> 4.4 and
+  collapses the server's between-batch gaps 2.4ms -> 0.3ms (fully saturated).
+  The win is one 8-thread OV pool running bigger GEMMs instead of three
+  3-thread pools; not deeper batching per se (batch stays ~4-5 of a possible 9).
+- **Tree reuse gives nothing at these depths**: analyzing 40 sequential turns of
+  one game (reuse-eligible ordering) is byte-for-byte the same wall time as the
+  same turns shuffled independently (140.5s vs 140.5s, 160 visits/turn,
+  1 process x 8 threads). Multi-turn analysis queries effectively search each
+  turn independently at this visit budget; real-workload throughput equals the
+  random-position numbers. (Also: random test games must stay sparse — dense
+  random fills produce superko-illegal positions the engine rejects.)
+- **Virtual losses are throughput-neutral** in the shared topology
+  (numVirtualLossesPerThread 1 vs 3: both 0.29 pos/s; 0 is rejected by config
+  validation). No re-tuning needed for the v2 recipe.
