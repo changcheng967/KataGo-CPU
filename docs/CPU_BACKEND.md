@@ -458,10 +458,11 @@ same-host same-run comparisons (tf2-b10c384, 8 threads, 200–400 visits):
 Conclusion: **the pipeline is extracted.** The 99.9% wait is inference compute on
 shared cores; scheduling, coalescing, batching, and threading all measurably
 bottom out. Throughput = kernel speed × ~⅔–¾ × (1 / 0.87 evals-per-visit). The
-batch guard is kept as an env-gated experimental knob (default off) — on this
+batch guard is kept as anenv-gated experimental knob (default off) — on this
 workload it is a measured null, but arrival-dense workloads (many-thread analysis
-servers) may differ. The only remaining levers: custom transformer attention
-kernels, or models that need fewer FLOPs per eval (the CGX track).
+servers) may differ. The only remaining levers are model-side: custom transformer
+attention kernels (measured: refuted for this shape, see the katflash section)
+or models that need fewer FLOPs per eval.
 
 ## Transformer kernel profiling (why there is little left to fuse)
 
