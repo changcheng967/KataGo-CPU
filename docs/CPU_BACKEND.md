@@ -735,12 +735,25 @@ barely used." Diagnosis, reproduced:
   multi-process recipes from the 8-core era are wrong here (they also multiply
   the model+cache footprint).
 
-**Recipe (2c/4GB):** one process, `numSearchThreads=2, onnxProvider=ov,
-onnxOVThreads=2`, model tf2-b10c384 (~13.5 v/s single game, 374MB). For
-multi-game throughput add `numAnalysisThreads=2, numSearchThreadsPerAnalysisThread=1`
-(shared evaluator: one model copy, minimal extra memory). Do not load b28/zhizi
-class nets; if long-running analysis servers grow, cap `nnCacheSize` to bound
-the eval cache.
+**Recipe v2 (2c/4GB, extracted ceiling ~14.6-14.9 v/s):** one process,
+`numSearchThreads=4, onnxOVThreads=2`, model tf2-b10c384, **taskset-pinned to
+physical cores**. Two upgrades over the first recipe (measured, interleaved):
+- **Pinning matters on quota cgroups**: this box is quota-limited (cpu.max
+  200000/100000) but cpuset-open (0-255) — threads drift across 256 CPUs of a
+  2-socket Genoa ES with cold caches. `taskset -c 0,1`-style pinning to physical
+  cores stabilizes and peaks throughput (drift ranged 11.3-14.0; pinned 14.1+).
+- **SMT TRAP: pinning to a sibling pair (e.g. cores 0+128) HALVES speed**
+  (7.4-7.5 v/s). Always pin distinct physical cores (lscpu -e=CPU,CORE).
+- **4 search threads beat 2 by +4.6%** (3/3 interleaved pairs, 14.65 vs 14.01
+  mean): with inference holding both cores, the extra search threads are
+  blocked during eval and only fill descent gaps between batches; 6/8 threads
+  are flat. avgBatch rises to ~2 but that is a side effect, not the win.
+- b18 convnet measured again on 2 cores: 7.09 v/s — tf2 is 2x faster; and
+  per-query `maxTime` (see service section) verified live: a 10000-visit query
+  capped at `maxTime:3.0` returned in 3.4s.
+For multi-game throughput add `numAnalysisThreads=2, numSearchThreadsPerAnalysisThread=2`
+(shared evaluator, one model copy). Do not load b28/zhizi class nets; cap
+`nnCacheSize` on long-running servers.
 
 ## Service-deployment findings (uvicorn-class environments)
 
