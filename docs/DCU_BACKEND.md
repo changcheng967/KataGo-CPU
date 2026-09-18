@@ -79,3 +79,22 @@ plausibly recover part of the attention share; that is upstream-kernel work,
 not backend wiring. Multi-game shared-evaluator mode measured WORSE than
 single-search benchmark on this box (492 vs 713 v/s aggregate) — analysis
 per-query overhead eats the batch-depth gain at 7-core feeding.
+
+## Dispatch-shape extraction round (post-kernel-patch, all measured)
+
+- **Batch guard on GPU: null** (avgBatch 10.3→11.4 across 0-2000µs, v/s within
+  variance) — same sparse-arrival equilibrium as CPU.
+- **Demand density: +5% at best** (t=96 × 4 server threads × nnMaxBatchSize=64:
+  710-716 v/s; doubling avgBatch 9.7→19.3 moved evals only +13% — per-batch
+  constant dominates, deep batching has strongly diminishing returns).
+- **Launch overhead ruled out**: mean kernel 199µs, attention 1084µs/call at
+  the best config (56,320 dispatches profiled, scripts/rocprof_aggregate.py) —
+  µs-scale launch costs are noise; hipGraphs would buy nothing (upstream has
+  no graph path anyway).
+- **Patched attention kernel confirmed in-engine at ~2.9 TFLOP/s** (was ~2.2):
+  the +33% held, but 4 concurrent server streams overlap and absorb it;
+  per-batch wall time is the serial 20-layer chain (≈20 × 1.1ms attention).
+
+Verdict: config-level and launch-level levers are exhausted on this box.
+The remaining lever is a deeper attention-kernel rewrite (half2-packed LDS
+tiles); everything else is at or near its measured ceiling.
