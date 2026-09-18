@@ -53,3 +53,29 @@ zhizi-b40c768**, with tf3-b11c768 as the balanced point.
 Container logistics that mattered: no internet in the pod, pod→login blocked
 (kubectl cp is the only supply path); media.katagotraining.org is directly
 fetchable on the login node.
+
+## Theoretical-max accounting (rocprof per-kernel attribution)
+
+Kernel-level profile of tf2 at the tuned config (66,304 dispatches, 7.43s of
+GPU kernel time over ~2.5s of wall search — the GPU is ~3x oversubscribed by
+kernel queue depth):
+
+| kernel class | GPU time share | calls |
+|---|---|---|
+| `flashAttentionKernelHalf<32,32,128,32>` (fused QK^T/softmax/AV) | **51.2%** | 5,180 |
+| hipBLAS GEMMs (all Cijk_Ailk_Bljk tiles) | ~38% | ~40,000 |
+| rmsNorm / swiGLU / cScaleBias-SiLU / RoPE (fused pointwise) | ~9% | ~26,000 |
+| fp16↔fp32 copy + misc | ~2% | ~2,200 |
+
+The upstream backend is already well-fused (custom flash-attention, fused
+normact/RoPE/SwiGLU — not generic ops). The engine's 604 evals/s = **33% of
+the 17.4 TFLOP/s fp16 GEMM peak** is bounded by the attention kernel's
+throughput at head_dim 32 / seq 361 shapes, plus the ~10% pointwise tail —
+not by missing fusion, CPU feeding (223%/700% CPU), or scheduling gaps.
+
+Remaining headroom, honestly: a flash-attention kernel specialized for
+gfx906's vector datapath (the shipped one targets CDNA matrix cores) could
+plausibly recover part of the attention share; that is upstream-kernel work,
+not backend wiring. Multi-game shared-evaluator mode measured WORSE than
+single-search benchmark on this box (492 vs 713 v/s aggregate) — analysis
+per-query overhead eats the batch-depth gain at 7-core feeding.
