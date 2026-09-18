@@ -230,6 +230,7 @@ int MainCmds::analysis(const vector<string>& args) {
     "whiteHandicapBonus",
     "overrideSettings",
     "maxVisits",
+    "maxTime",
     "analysisPVLen",
     "rootFpuReductionMax",
     "rootPolicyTemperature",
@@ -979,6 +980,14 @@ int MainCmds::analysis(const vector<string>& args) {
 
       if(input.find("maxVisits") != input.end()) {
         bool suc = parseInteger(input, "maxVisits", rbase.params.maxVisits, 1, (int64_t)1 << 50, "Must be an integer from 1 to 2^50");
+        if(!suc)
+          continue;
+      }
+
+      //Per-query time cap, mirroring maxVisits. Drives the same SearchParams
+      //field the GTP path uses (search loop stops once timeUsed >= maxTime).
+      if(input.find("maxTime") != input.end()) {
+        bool suc = parseDouble(input, "maxTime", rbase.params.maxTime, 0.0, 1.0e20, "Must be a number from 0 to 1e20");
         if(!suc)
           continue;
       }

@@ -741,3 +741,37 @@ multi-game throughput add `numAnalysisThreads=2, numSearchThreadsPerAnalysisThre
 (shared evaluator: one model copy, minimal extra memory). Do not load b28/zhizi
 class nets; if long-running analysis servers grow, cap `nnCacheSize` to bound
 the eval cache.
+
+## Service-deployment findings (uvicorn-class environments)
+
+Three reported issues, adjudicated against source:
+
+1. **`maxTime` in analysis queries — was true, now patched.** The analysis
+   engine never exposed a per-query time cap (upstream KataGo doesn't either —
+   not a fork regression). Patched in `cpp/command/analysis.cpp`: queries now
+   accept `"maxTime": <seconds>`, wired to the existing `SearchParams.maxTime`
+   the GTP path uses (search loop stops once time is used up). Build required.
+2. **`modelCacheDir` — never existed** in this fork or upstream. The nearest
+   real keys: `onnxOVCacheDir` (this fork, OpenVINO IR compile cache). A
+   "download models here" path is service-side responsibility.
+3. **"Engine dies instantly in service, works manually" — two prime suspects,
+   both covered by `cpp/scripts/engine_supervisor.py`:**
+   - spawn env missing `LD_LIBRARY_PATH` → the dynamic loader kills the binary
+     before `main()` (OV libs are outside default paths; manual runs always
+     exported it);
+   - stderr pipe never drained → the engine blocks after ~64KB of warning spam
+     (`warnUnusedFields` fires on every unexpected query field — see above) and
+     looks dead.
+   The supervisor spawns with explicit env, drains both pipes, classifies every
+   death (127=loader, SIGKILL=OOM+last RSS, SIGSEGV, clean exit) into
+   `engine_logs/deaths.jsonl` with stderr tails, and restarts with capped
+   backoff. For services, also set `warnUnusedFields=false`.
+
+### 2c/4GB extra speed notes (beyond the (2,2) recipe)
+
+- `nnMaxBatchSize=1` — avgBatch is 1.00 anyway at 2 cores; shrinks batch
+  buffers and per-batch scratch (untested on-box: expected ±0, saves memory).
+- `warnUnusedFields=false` in service configs — cuts the stderr firehose.
+- Untested variants queued for next session: `numSearchThreads=3/4` with
+  `onnxOVThreads=2` (a third search thread is blocked during inference and
+  only fills descent gaps — marginal at best).
