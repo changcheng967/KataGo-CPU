@@ -706,3 +706,38 @@ Three follow-up cracks around the shared-evaluator recipe, measured and closed:
 - **Virtual losses are throughput-neutral** in the shared topology
   (numVirtualLossesPerThread 1 vs 3: both 0.29 pos/s; 0 is rejected by config
   validation). No re-tuning needed for the v2 recipe.
+
+## Small-box recipe (2 cores / 4 GB — the downgraded container)
+
+The container was cut from 8c/15GB to 2c/3.9GB (cgroup: cpu.max 200000/100000,
+memory.max 4GB, no swap). Symptom reported: "OV backend always memory full, CPU
+barely used." Diagnosis, reproduced:
+
+- The memory pressure is **model choice, not the OV backend**: tf2-b10c384 peaks
+  at **374MB RSS**; b28c512 peaks at **1067MB** (and collapses to 2.66 v/s on 2
+  cores); zhizi-b40c768 **OOM-kills the whole container during load** (reproduced
+  twice — the second time it took the SSH session with it). On a 4GB no-swap
+  cgroup, the b28-class and larger nets are dead on arrival; "CPU barely used"
+  is the engine being OOM-killed/restarted, not a scheduler problem.
+- On 2 cores the batching trade inverts: full-width inference beats batch
+  coalescing by 75%. Matrix (tf2, 100 visits, peak RSS tracked):
+
+| config | v/s | avgBatch | peak RSS |
+|---|---|---|---|
+| **2 search × 2 OV threads** | **13.5** | 1.00 | 374MB |
+| 2 × 1 | 7.4 | 1.00 | 363MB |
+| 3 × 1 | 7.7 | 1.48 | 363MB |
+| 4 × 1 | 7.7 | 1.96 | 363MB |
+| 6 × 1 | 7.4 | 2.88 | 366MB |
+
+  Halving inference width to let batches form (avgBatch up to 2.9) loses badly:
+  on two cores, batch-1 full-width serial inference IS the right shape, and the
+  multi-process recipes from the 8-core era are wrong here (they also multiply
+  the model+cache footprint).
+
+**Recipe (2c/4GB):** one process, `numSearchThreads=2, onnxProvider=ov,
+onnxOVThreads=2`, model tf2-b10c384 (~13.5 v/s single game, 374MB). For
+multi-game throughput add `numAnalysisThreads=2, numSearchThreadsPerAnalysisThread=1`
+(shared evaluator: one model copy, minimal extra memory). Do not load b28/zhizi
+class nets; if long-running analysis servers grow, cap `nnCacheSize` to bound
+the eval cache.
