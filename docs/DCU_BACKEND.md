@@ -1,36 +1,49 @@
-# Hygon DCU backend (`onnxProvider=dcu`, planned)
+# Hygon DCU support (`USE_BACKEND=ROCM` against DTK) — WORKING
 
-Native KataGo backend for Hygon DCU (DTK), following the flat backend-file
-structure of `eigenbackend.cpp` / `onnxbackend.cpp`. Target device, measured
-on the actual card (Z200SM_80, gfx906, 64 CU, DTK 26.04):
+## Status: official backend runs on DCU with ZERO code changes
 
-| metric | measured |
+KataGo's upstream CUDA/ROCm shared backend (`cudaandrocmbackend.inc` via
+`rocmbackend.cpp`) configures, builds, and runs against Hygon DTK 26.04 on the
+Z200SM_80 (gfx906) with no patches:
+
+```
+cmake -S cpp -B build-rocm -DUSE_BACKEND=ROCM \
+  -DCMAKE_HIP_COMPILER=/opt/dtk/llvm/bin/clang++ \
+  -DCMAKE_HIP_ARCHITECTURES=gfx906 \
+  -DCMAKE_PREFIX_PATH=/opt/dtk -DCMAKE_BUILD_TYPE=Release
+make -C build-rocm -j6 katago
+```
+
+Build notes: source must carry its `.git` dir (git-info step), and git needs
+`safe.directory` after kubectl-cp ownership changes. `katago version` reports
+"Using ROCm backend, HIP 6.3". fp16 is auto-selected (`useFP16 = true`).
+
+## Device qualification (measured, cpp/scripts/gpubench*.cpp)
+
+| metric | value |
 |---|---|
-| fp32 GEMM (rocblas) | 10.4 TFLOP/s = 96% of device ceiling |
-| fp16 GEMM (hipblasHgemm; GemmEx does not exist in DTK) | 17.4 TFLOP/s = 80% |
-| HBM bandwidth | 683 GB/s |
-| formats | no BF16, no MFMA (GCN5 vector datapath) |
+| Device | Z200SM_80, 64 CU, gfx906 (GCN5 vector, no MFMA/BF16), 17.2 GB |
+| fp32 GEMM | 10.4 TFLOP/s (96% of the 10.8 ceiling) |
+| fp16 GEMM (hipblasHgemm) | 17.4 TFLOP/s (80% of 21.6) |
+| HBM | 683 GB/s |
 
-fp16 is the deployment precision (10 mantissa bits > the bf16 CPU path's 7,
-which was validated end-to-end at ~99% best-move agreement).
+## Engine results (official auto-tuner, 7-core quota + 1 DCU)
 
-## Plan A (official path, first to try): build upstream cudaandrocm backend
+Tuner verdict: **numSearchThreads=32 + numNNServerThreadsPerModel=2**
+(it found the 2-server-thread +17.3% itself). avgBatch ~10-15.
 
-Upstream ships `cudaandrocmbackend.inc` — the CUDA backend compiles against
-ROCm/HIP. DTK is a HIP fork with miopen + rocblas present in the container;
-a DTK build of the official backend may work with modest patches.
+| model | v/s | vs 8-core Zen4 CPU | per-visit Elo anchor |
+|---|---|---|---|
+| tf2-b10c384 | **556** | 10.3x (54) | 13,712 |
+| tf3-b11c768 | 162 | ~8x | ~14,700 |
+| zhizi-b40c768 | **117** | (unusable on small CPU boxes) | ~14,800 |
 
-## Plan B (extraction path): custom executor, fixed op routing
+**Headline: the DCU inverts the CPU model ranking.** On CPU, zhizi-b40 was the
+OOM-killer and tf2 was the only sane choice; on the DCU the strongest official
+net (zhizi) runs at 117 v/s — 4.75x fewer visits than tf2 gets cannot buy back
+~1,100 Elo of per-visit strength, so **strongest-per-wall-clock on DCU is
+zhizi-b40c768**, with tf3-b11c768 as the balanced point.
 
-Mirrors the OV-native provider pattern (ONNX stays the model contract):
-hipblasHgemm for FC GEMMs (~85% FLOPs), hipblasHgemmStridedBatched for the
-[N,H,361,361] attention GEMMs, fused custom HIP kernels for the
-RMSNorm+SiLU+residual+mask chains, RoPE and 361-softmax (math already proven
-in cpp/scripts/katflash/), im2col+GEMM for the two 3x3 convs. Projected
-200-350 pos/s for tf2-b10c384 vs 46 evals/s on the 8-core CPU box.
-
-## Dev loop (no GPU, no network needed)
-
-- `cpp/scripts/gen_dev_graph.py` — small KataGo-shaped ONNX (same op mix)
-- `cpp/scripts/ref_eval.py` — fp32 reference vectors via onnx.reference
-- `cpp/scripts/gpubench.cpp`, `gpubench16.cpp` — device qualification
+Container logistics that mattered: no internet in the pod, pod→login blocked
+(kubectl cp is the only supply path); media.katagotraining.org is directly
+fetchable on the login node.
