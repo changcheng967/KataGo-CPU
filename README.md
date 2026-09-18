@@ -1,4 +1,43 @@
-# KataGo
+# KataGo-XPU
+
+**A CPU + DCU performance fork of KataGo** — every claim in this fork is
+measured on real silicon, with the receipts in the docs and reproducible
+scripts in `cpp/scripts/`.
+
+## What this fork adds
+
+**CPU (OpenVINO native backend, `onnxProvider=ov`)**
+- Native OpenVINO provider: shared `ov::Core`/`CompiledModel`, zero-copy input
+  tensors, IR (.xml) model loading, bf16 on AVX512-BF16 CPUs. tf2-b10c384 runs
+  at 98% of the measured practical GEMM peak.
+- AVX-512 PUCT child-selection vectorization (+2-3% engine visits/s,
+  bit-identical to scalar), `KATAGO_SEARCH_TIMING` phase profiler.
+- Shared-evaluator deployment recipe (`numAnalysisThreads>=2`): +21% multi-game
+  throughput over multi-process splits.
+- Complete measured exhaustion log: batch pipeline, search phase (0.1% of wall),
+  call-pattern attribution, and the small-box (2c/4GB) recipe incl. the SMT
+  pinning trap (-50%) and model-memory diagnosis.
+- Per-query `maxTime` support in the analysis engine.
+
+**Hygon DCU (`USE_BACKEND=ROCM` against DTK) — works with zero code changes**
+- Upstream's CUDA/ROCm shared backend configures, builds, and runs on Hygon
+  DTK 26.04 (gfx906) unpatched; fp16 auto-selected.
+- On a 7-core quota + one Z200SM_80: **tf2-b10c384 = 556 v/s** (10.3x the
+  8-core Zen4 CPU box), tf3-b11c768 = 162, **zhizi-b40c768 = 117 — the
+  strongest-per-wall-clock choice on GPU** (the CPU model ranking inverts).
+- Tuner verdict: `numSearchThreads=32` + `numNNServerThreadsPerModel=2`.
+
+## Docs index
+
+| doc | contents |
+|---|---|
+| [docs/CPU_BACKEND.md](docs/CPU_BACKEND.md) | CPU build/run guide, all measurements, tuning recipes, exhaustion log |
+| [docs/DCU_BACKEND.md](docs/DCU_BACKEND.md) | DCU build on DTK, device qualification, engine results, container logistics |
+| `cpp/scripts/` | every benchmark/A-B/validation script referenced by the docs |
+
+---
+
+# KataGo (upstream)
 
 - [KataGo](#katago)
   - [Overview](#overview)
@@ -18,8 +57,8 @@
       - [Common Problems](#common-problems)
       - [Other Questions](#other-questions)
   - [Features for Developers](#features-for-developers)
-      - [GTP Extensions:](#gtp-extensions)
-      - [Analysis Engine:](#analysis-engine)
+    - [GTP Extensions:](#gtp-extensions)
+    - [Analysis Engine:](#analysis-engine)
   - [Compiling KataGo](#compiling-katago)
   - [Source Code Overview:](#source-code-overview)
   - [Selfplay Training:](#selfplay-training)

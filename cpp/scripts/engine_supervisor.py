@@ -45,11 +45,11 @@ proc = None
 death_log = []
 
 
-def classify(returncode, stderr_tail, rss_kb):
+def classify(returncode, stderr_tail):
     if returncode == 127:
         return "loader/exec failure (127): missing library or interpreter - check LD_LIBRARY_PATH"
     if returncode == -signal.SIGKILL:
-        return "SIGKILL: OOM-killer or manual kill" + (f", last RSS {rss_kb}KB" if rss_kb else "")
+        return "SIGKILL: OOM-killer or manual kill (RSS is unrecoverable post-mortem on this kernel)"
     if returncode == -signal.SIGSEGV:
         return "SIGSEGV: crash - see stderr tail"
     if returncode == 0:
@@ -75,12 +75,6 @@ def monitor():
         lifetime = time.time() - t0
         feh.flush(); foh.flush()
         feh.close(); foh.close()
-        rss = 0
-        try:
-            with open(f"/proc/{proc.pid}/status") as f:
-                pass
-        except Exception:
-            pass
         tail = b""
         try:
             with open(err_path, "rb") as f:
@@ -88,7 +82,7 @@ def monitor():
                 tail = f.read()
         except Exception:
             pass
-        reason = classify(rc, tail, rss)
+        reason = classify(rc, tail)
         rec = {"run": run_id, "pid": proc.pid, "lifetime_s": round(lifetime, 2),
                "reason": reason, "stderr_tail": tail.decode("utf-8", "replace")[-500:]}
         death_log.append(rec)
