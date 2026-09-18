@@ -32,11 +32,17 @@ Build notes: source must carry its `.git` dir (git-info step), and git needs
 Tuner verdict: **numSearchThreads=32 + numNNServerThreadsPerModel=2**
 (it found the 2-server-thread +17.3% itself). avgBatch ~10-15.
 
-| model | v/s | vs 8-core Zen4 CPU | per-visit Elo anchor |
-|---|---|---|---|
-| tf2-b10c384 | **556** | 10.3x (54) | 13,712 |
-| tf3-b11c768 | 162 | ~8x | ~14,700 |
-| zhizi-b40c768 | **117** | (unusable on small CPU boxes) | ~14,800 |
+| model | v/s @100 visits | v/s @800 visits | vs 8-core Zen4 CPU | per-visit Elo anchor |
+|---|---|---|---|---|
+| tf2-b10c384 | **556** | **713** | 13.2x (54) | 13,712 |
+| tf3-b11c768 | 162 | 190 | ~9x | ~14,700 |
+| zhizi-b40c768 | **117** | **136** | (unusable on small CPU boxes) | ~14,800 |
+
+During sustained search the DCU runs at **100% utilization, 175W of the 450W
+cap, 60°C, VRAM 6%** — the GPU is the worker, thermally and power-wise nowhere
+near limits. Deeper searches feed it better (more evals in flight): all models
+gain 15-28% from v=100 to v=800; analysis workloads at 1000+ visits will sit at
+the top of these ranges.
 
 **Headline: the DCU inverts the CPU model ranking.** On CPU, zhizi-b40 was the
 OOM-killer and tf2 was the only sane choice; on the DCU the strongest official
