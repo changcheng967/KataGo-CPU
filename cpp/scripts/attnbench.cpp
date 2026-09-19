@@ -1,3 +1,15 @@
+// DCU attention-kernel development harness (Z200SM_80 / gfx906).
+// Variants: V0 upstream verbatim | V1 4-acc dot | V2 tile-deferred rescale
+// (+33%, shipped in cudaandrocmhelpers.inc) | V5 half2-packed tiles |
+// V3/V4 QPT register-blocking (rejected: VGPR spills).
+// All variants diffed against an exact CPU fp32 reference at engine shapes.
+// Measured at B=10 L=361 H=6 dh=32, BLOCK_KV=32:
+//   V0 1.77 | V1 1.80 | V2 2.35 (shipped) | V5 2.34 TFLOP/s
+// half2 packing gained nothing further: K/V tile reads are wave-broadcast
+// (all threads read the same tile row simultaneously), so LDS bytes were
+// never the post-V2 binding constraint. BLOCK_KV=64/128 measured worse
+// (1.97/1.17): tail waste at seq 361 plus ePriv register growth outweigh
+// the halved barrier count. QPT=2/4 spills VGPRs (0.58-1.65).
 // Standalone bench of KataGo's tiled flash-attention kernel on gfx906,
 // then incrementally optimized variants. Real engine shapes: batch 10,
 // seq 361, heads 6, headDim 32, mask mostly-ones.
